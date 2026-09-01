@@ -866,9 +866,28 @@ def _orpo_log_odds(chosen, rejected):
     return chosen_odds - rejected_odds
 
 
-def make_orpo_loss_fn(beta=0.1):
+def _require_kind(objective, kind):
+    if objective.kind != kind:
+        raise ValueError(
+            f"Unsloth MLX preference: the {kind.upper()} loss needs an "
+            f"objective of kind '{kind}', not '{objective.kind}'."
+        )
+
+
+def _require_reference(objective, reference_policy):
+    if objective.kind == "dpo" and not objective.reference_free \
+            and reference_policy is None:
+        raise ValueError(
+            "Unsloth MLX DPO: this objective scores against a reference "
+            "policy, but none was given. Pass one as reference_policy, or "
+            "build the objective with reference_free=True."
+        )
+
+
+def make_orpo_loss_fn(objective):
     """Create an ORPO loss with exact logical-window normalization."""
-    beta = float(beta)
+    _require_kind(objective, "orpo")
+    beta = objective.beta
 
     def loss_fn(model, batch, lengths, normalizers):
         nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
@@ -983,22 +1002,305 @@ def _response_logps(model, batch, lengths):
     return -(ce * _response_mask(targets, lengths)).sum(axis=1)
 
 
-def make_dpo_loss_fn(
-    *, beta=0.1, label_smoothing=0.0, reference_policy=None, reference_free=False,
+# TRL's own warning list, narrower than the set that drops the value: discopop
+# drops it silently.
+_DPO_SMOOTHING_WARNINGS = frozenset({
+    "hinge", "ipo", "bco_pair", "sppo_hard", "nca_pair", "apo_zero", "apo_down",
+})
+
+# These read the reference log probabilities themselves rather than the ratios,
+# so a reference-free run, which never computes them, leaves them nothing to
+# score. TRL computes the reference regardless and does not notice.
+_DPO_NEEDS_REFERENCE = frozenset({
+    "sppo_hard", "nca_pair", "aot_pair", "aot", "discopop",
+})
+
+_DPO_REFUSED = {
+    "bco_pair": (
+        "it subtracts a running mean of rewards carried across optimizer steps, "
+        "so its value would depend on micro-batch order and on what a "
+        "checkpoint happened to hold"
+    ),
+    "kto_pair": "TRL removed it from DPO training in favour of a KTO trainer",
+}
+
+
+@dataclass(frozen=True)
+class _DPOTerms:
+    """The four log probabilities a variant reads, and the ratios TRL derives.
+
+    ``delta`` groups its subtraction as TRL does rather than the equivalent
+    ``chosen_ratio - rejected_ratio``, which is not the same in float32.
+    """
+
+    chosen: object
+    rejected: object
+    ref_chosen: object
+    ref_rejected: object
+    chosen_ratio: object
+    rejected_ratio: object
+    delta: object
+
+
+def _dpo_smoothed_sigmoid(objective, delta):
+    scaled = objective.beta * delta
+    epsilon = objective.label_smoothing
+    return -(
+        (1.0 - epsilon) * _log_sigmoid(scaled) + epsilon * _log_sigmoid(-scaled)
+    )
+
+
+def _dpo_robust(objective, terms):
+    scaled = objective.beta * terms.delta
+    epsilon = objective.label_smoothing
+    return (
+        -_log_sigmoid(scaled) * (1.0 - epsilon) + _log_sigmoid(-scaled) * epsilon
+    ) / (1.0 - 2.0 * epsilon)
+
+
+def _dpo_exo_pair(objective, terms):
+    scaled = objective.beta * terms.delta
+    epsilon = objective.label_smoothing
+    return (
+        mx.sigmoid(scaled) * (_log_sigmoid(scaled) - math.log(1.0 - epsilon))
+        + mx.sigmoid(-scaled) * (_log_sigmoid(-scaled) - math.log(epsilon))
+    )
+
+
+def _dpo_hinge(objective, terms):
+    value = 1.0 - objective.beta * terms.delta
+    return mx.maximum(value, mx.array(0.0, dtype=value.dtype))
+
+
+def _dpo_ipo(objective, terms):
+    return (terms.delta - 1.0 / (2.0 * objective.beta)) ** 2
+
+
+def _dpo_sppo_hard(objective, terms):
+    half = 0.5 / objective.beta
+    return (terms.chosen_ratio - half) ** 2 + (terms.rejected_ratio + half) ** 2
+
+
+def _dpo_nca_pair(objective, terms):
+    chosen_rewards = terms.chosen_ratio * objective.beta
+    rejected_rewards = terms.rejected_ratio * objective.beta
+    return (
+        -_log_sigmoid(chosen_rewards)
+        - 0.5 * _log_sigmoid(-chosen_rewards)
+        - 0.5 * _log_sigmoid(-rejected_rewards)
+    )
+
+
+def _dpo_aot_pair(objective, terms):
+    return _dpo_smoothed_sigmoid(objective, (
+        mx.sort(terms.chosen_ratio, axis=0)
+        - mx.sort(terms.rejected_ratio, axis=0)
+    ))
+
+
+def _dpo_aot(objective, terms):
+    return _dpo_smoothed_sigmoid(objective, (
+        mx.sort(terms.chosen - terms.rejected, axis=0)
+        - mx.sort(terms.ref_chosen - terms.ref_rejected, axis=0)
+    ))
+
+
+def _dpo_apo_zero(objective, terms):
+    return (
+        1.0 - mx.sigmoid(objective.beta * terms.chosen_ratio)
+        + mx.sigmoid(objective.beta * terms.rejected_ratio)
+    )
+
+
+def _dpo_apo_down(objective, terms):
+    return (
+        mx.sigmoid(objective.beta * terms.chosen_ratio)
+        + 1.0 - mx.sigmoid(
+            objective.beta * (terms.chosen_ratio - terms.rejected_ratio)
+        )
+    )
+
+
+def _dpo_discopop(objective, terms):
+    scaled = objective.beta * terms.delta
+    modulation = mx.sigmoid(scaled / objective.discopop_tau)
+    return (
+        -_log_sigmoid(scaled) * (1.0 - modulation)
+        + mx.exp(-scaled) * modulation
+    )
+
+
+_DPO_VARIANTS = {
+    "sigmoid": lambda objective, terms: _dpo_smoothed_sigmoid(
+        objective, terms.delta,
+    ),
+    "robust": _dpo_robust,
+    "exo_pair": _dpo_exo_pair,
+    "hinge": _dpo_hinge,
+    "ipo": _dpo_ipo,
+    "sppo_hard": _dpo_sppo_hard,
+    "nca_pair": _dpo_nca_pair,
+    "aot_pair": _dpo_aot_pair,
+    "aot": _dpo_aot,
+    "apo_zero": _dpo_apo_zero,
+    "apo_down": _dpo_apo_down,
+    "discopop": _dpo_discopop,
+}
+
+
+@dataclass(frozen=True)
+class PreferenceObjective:
+    """What a preference run optimizes, resolved once and scored everywhere."""
+
+    kind: str
+    beta: float
+    label_smoothing: float = 0.0
+    loss_types: tuple = ("sigmoid",)
+    weights: tuple = (1.0,)
+    discopop_tau: float = 0.05
+    reference_free: bool = False
+
+    def __post_init__(self):
+        # Frozen stops rebinding, not editing what a list holds.
+        object.__setattr__(self, "loss_types", tuple(self.loss_types))
+        object.__setattr__(self, "weights", tuple(self.weights))
+        if self.kind not in ("dpo", "orpo"):
+            raise ValueError(
+                f"Unsloth MLX preference: unknown objective kind '{self.kind}'."
+            )
+        if not math.isfinite(self.beta) or self.beta < 0:
+            raise ValueError(
+                "Unsloth MLX preference: beta must be finite and non-negative, "
+                f"not {self.beta}."
+            )
+        if self.kind != "dpo":
+            # ORPO reads beta and nothing below, and each loss takes only its
+            # own kind, so nothing else here reaches a reader that would mind.
+            return
+        if len(self.weights) != len(self.loss_types):
+            raise ValueError(
+                f"Unsloth MLX DPO: loss_weights has {len(self.weights)} entries "
+                f"for {len(self.loss_types)} loss types; they must be the same "
+                "length."
+            )
+        if not self.loss_types:
+            raise ValueError(
+                "Unsloth MLX DPO: loss_type must name at least one loss."
+            )
+        if not all(math.isfinite(weight) for weight in self.weights):
+            # A NaN or infinite weight carries into every pair of the step.
+            raise ValueError(
+                f"Unsloth MLX DPO: loss_weights must all be finite, not "
+                f"{list(self.weights)}."
+            )
+        for name in self.loss_types:
+            if name in _DPO_REFUSED:
+                raise ValueError(
+                    f"Unsloth MLX DPO: loss_type '{name}' is not supported "
+                    f"because {_DPO_REFUSED[name]}."
+                )
+            if name not in _DPO_VARIANTS:
+                raise ValueError(
+                    f"Unsloth MLX DPO: unknown loss_type '{name}'. Supported: "
+                    f"{', '.join(sorted(_DPO_VARIANTS))}."
+                )
+        if not 0 <= self.label_smoothing < 0.5:
+            # The range the parameter is defined over, and the one bound to
+            # state: robust divides by 1 - 2 * it, exo_pair logs 1 - it.
+            raise ValueError(
+                "Unsloth MLX DPO: label_smoothing must be in [0, 0.5), not "
+                f"{self.label_smoothing}."
+            )
+        if self.label_smoothing == 0 and "exo_pair" in self.loss_types:
+            # exo_pair takes log(label_smoothing), which has no answer at
+            # zero. TRL applies this floor from inside exo_pair's own branch,
+            # so anything listed ahead of it misses it on the first
+            # micro-batch only; the value is the same, the timing is not.
+            object.__setattr__(self, "label_smoothing", 1e-3)
+        if "discopop" in self.loss_types and not 0 < self.discopop_tau < math.inf:
+            # discopop divides by it, and the delta is zero while the
+            # reference still matches the policy, so zero is NaN, not sharper.
+            raise ValueError(
+                "Unsloth MLX DPO: discopop_tau must be finite and above zero, "
+                f"not {self.discopop_tau}."
+            )
+        unscorable = [
+            name for name in self.loss_types if name in _DPO_NEEDS_REFERENCE
+        ]
+        if self.reference_free and unscorable:
+            raise ValueError(
+                f"Unsloth MLX DPO: {', '.join(unscorable)} score against the "
+                "reference log probabilities themselves, which reference_free "
+                "never computes. Set reference_free=False, or pick a loss_type "
+                "that only reads the policy-minus-reference difference."
+            )
+
+    @property
+    def length_normalized(self):
+        """IPO scores per-token log probabilities. TRL divides before any
+        variant runs, so naming it anywhere moves the rest of the list."""
+        return "ipo" in self.loss_types
+
+
+def resolve_preference_objective(
+    kind, *, beta, label_smoothing=0.0, loss_type="sigmoid",
+    loss_weights=None, discopop_tau=0.05, reference_free=False,
 ):
-    """Create sigmoid DPO with conservative preference-label smoothing."""
+    """Normalize a preference configuration into the objective both paths score.
+
+    Only the configuration's own spellings are resolved here; every setting a
+    loss depends on is established by the objective, so a caller that builds one
+    directly gets the same. The reference policy is a model rather than a
+    setting, so the factories take it separately.
+    """
     beta = float(beta)
-    epsilon = float(label_smoothing)
+    if kind == "orpo":
+        return PreferenceObjective(kind="orpo", beta=beta)
+    names = (loss_type,) if isinstance(loss_type, str) else tuple(loss_type)
+    if loss_weights is None:
+        weights = (1.0,) * len(names)
+    else:
+        weights = tuple(float(weight) for weight in loss_weights)
+    objective = PreferenceObjective(
+        kind=kind, beta=beta, label_smoothing=float(label_smoothing),
+        loss_types=names, weights=weights,
+        discopop_tau=float(discopop_tau), reference_free=bool(reference_free),
+    )
+    ignored = [name for name in names if name in _DPO_SMOOTHING_WARNINGS]
+    if float(label_smoothing) > 0 and ignored:
+        warnings.warn(
+            f"Unsloth MLX DPO: {', '.join(ignored)} ignore label_smoothing; "
+            "pass label_smoothing=0.0 to silence this.",
+            RuntimeWarning,
+        )
+    return objective
+
+
+def _weighted_rewards(rewards, weights):
+    total = rewards * weights[0]
+    for weight in weights[1:]:
+        total = total + rewards * weight
+    return total
+
+
+def _dpo_pair_loss(objective, terms):
+    total = None
+    for name, weight in zip(objective.loss_types, objective.weights):
+        term = _DPO_VARIANTS[name](objective, terms) * weight
+        total = term if total is None else total + term
+    return total
+
+
+def make_dpo_loss_fn(objective, *, reference_policy=None):
+    """Create the DPO loss for a resolved objective."""
+    _require_kind(objective, "dpo")
+    _require_reference(objective, reference_policy)
 
     def loss_fn(model, batch, lengths, normalizers):
-        margin, stats = _dpo_scores(
-            model, batch, lengths, beta=beta,
-            reference_policy=reference_policy, reference_free=reference_free,
+        terms, stats = _dpo_scores(
+            model, batch, lengths, objective, reference_policy=reference_policy,
         )
-        pair_loss = -(
-            (1.0 - epsilon) * _log_sigmoid(margin)
-            + epsilon * _log_sigmoid(-margin)
-        )
+        pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * pair_loss.sum() / mx.maximum(
             window_pairs, mx.array(1),
@@ -1206,43 +1508,53 @@ def _orpo_scores(model, batch, lengths, beta):
     return nll_sum, nll_tokens, ratio, stats
 
 
-def _dpo_scores(model, batch, lengths, *, beta, reference_policy, reference_free):
-    """Score one DPO batch: the preference margin, then the metrics for the log."""
+def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
+    """Score one DPO batch: the variants' terms, then the metrics for the log."""
     logits, ce, mask = _preference_forward(model, batch, lengths)
     pairs = batch.shape[0] // 2
     logps = -(ce * mask).sum(axis=1)
-    if reference_free:
+    if objective.reference_free:
         reference = mx.zeros(logps.shape, dtype=logps.dtype)
     else:
         reference = reference_policy.forward(model, batch, lengths)
+    if objective.length_normalized:
+        counts = mx.maximum(mask.sum(axis=1), mx.array(1.0))
+        logps = logps / counts
+        reference = reference / counts
+    beta = objective.beta
     chosen, rejected = logps[:pairs], logps[pairs:]
-    chosen_rewards = beta * (chosen - reference[:pairs])
-    rejected_rewards = beta * (rejected - reference[pairs:])
-    margin = beta * (
-        (chosen - rejected) - (reference[:pairs] - reference[pairs:])
-    )
+    ref_chosen, ref_rejected = reference[:pairs], reference[pairs:]
+    # TRL adds the rewards up once per entry, so a two-entry list reports twice
+    # what a one-entry list does. In its order, not scaled by the summed
+    # weights, which is a different float32 number.
     stats = _preference_stats(
         "dpo", logits, mask,
         chosen=chosen, rejected=rejected,
-        chosen_rewards=chosen_rewards, rejected_rewards=rejected_rewards,
+        chosen_rewards=_weighted_rewards(
+            beta * (chosen - ref_chosen), objective.weights),
+        rejected_rewards=_weighted_rewards(
+            beta * (rejected - ref_rejected), objective.weights),
     )
-    return margin, stats
+    terms = _DPOTerms(
+        chosen=chosen, rejected=rejected,
+        ref_chosen=ref_chosen, ref_rejected=ref_rejected,
+        chosen_ratio=chosen - ref_chosen,
+        rejected_ratio=rejected - ref_rejected,
+        delta=(chosen - rejected) - (ref_chosen - ref_rejected),
+    )
+    return terms, stats
 
 
-def make_preference_eval_fn(
-    kind, *, beta=0.1, label_smoothing=0.0,
-    reference_policy=None, reference_free=False,
-):
+def make_preference_eval_fn(objective, *, reference_policy=None):
     """Score one preference batch as ``(loss, pairs, stats)``.
 
     ``stats`` holds a numerator per metric in ``PREFERENCE_EVAL_METRICS[kind]``
     order, then the denominators ``PREFERENCE_EVAL_DENOMINATORS[kind]`` names.
-    Nothing is a per-batch mean: summing the vector across batches and dividing
-    each numerator by its own total averages the eval set exactly, however
-    unlike the batches are.
+    Nothing is a per-batch mean, so the eval set averages exactly.
     """
-    beta = float(beta)
-    epsilon = float(label_smoothing)
+    _require_reference(objective, reference_policy)
+    kind = objective.kind
+    beta = objective.beta
 
     def eval_fn(model, batch, lengths, _normalizers=None):
         pairs = batch.shape[0] // 2
@@ -1255,14 +1567,11 @@ def make_preference_eval_fn(
                 - beta * ratio.mean()
             )
         else:
-            margin, stats = _dpo_scores(
-                model, batch, lengths, beta=beta,
-                reference_policy=reference_policy, reference_free=reference_free,
+            terms, stats = _dpo_scores(
+                model, batch, lengths, objective,
+                reference_policy=reference_policy,
             )
-            loss = -(
-                (1.0 - epsilon) * _log_sigmoid(margin)
-                + epsilon * _log_sigmoid(-margin)
-            ).mean()
+            loss = _dpo_pair_loss(objective, terms).mean()
         return loss, mx.array(pairs, dtype=mx.int32), stats
 
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]

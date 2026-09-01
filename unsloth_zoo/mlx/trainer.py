@@ -617,6 +617,7 @@ from .preference import (
     make_dpo_loss_fn,
     make_orpo_loss_fn,
     make_preference_eval_fn,
+    resolve_preference_objective,
     resolve_preference_length_policy,
 )
 from .compile import (
@@ -1339,6 +1340,9 @@ class MLXTrainingConfig:
             "num_generation_prompts",
             "generation_max_tokens",
             "generation_temperature",
+            "loss_type",
+            "loss_weights",
+            "discopop_tau",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1427,6 +1431,10 @@ class MLXDPOConfig(MLXTrainingConfig):
     beta: float = field(default=0.1, kw_only=True)
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
+    # A DPOConfig collapses a one-entry list back to a string, so both arrive.
+    loss_type: str | list[str] = field(default="sigmoid", kw_only=True)
+    loss_weights: list[float] | None = field(default=None, kw_only=True)
+    discopop_tau: float = field(default=0.05, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
     max_length: int | None = field(default=1024, kw_only=True)
     max_prompt_length: int | None = field(default=512, kw_only=True)
@@ -5396,12 +5404,22 @@ class MLXTrainer:
         preference_eval_fn = None
         if preference_kind:
             if preference_kind == "orpo":
-                loss_fn = make_orpo_loss_fn(beta=args.beta)
+                objective = resolve_preference_objective("orpo", beta=args.beta)
+                loss_fn = make_orpo_loss_fn(objective)
                 self._preference_reference_provenance = {
                     "kind": "orpo_no_reference"
                 }
                 _main_print(f"Unsloth: Using ORPO loss (beta={args.beta}).")
             else:
+                objective = resolve_preference_objective(
+                    "dpo",
+                    beta=args.beta,
+                    label_smoothing=args.label_smoothing,
+                    loss_type=args.loss_type,
+                    loss_weights=args.loss_weights,
+                    discopop_tau=args.discopop_tau,
+                    reference_free=bool(args.reference_free),
+                )
                 reference_policy, provenance = build_reference_policy(
                     model,
                     reference_free=bool(args.reference_free),
@@ -5416,23 +5434,19 @@ class MLXTrainer:
                 # the same ones the loss does. NEFTune is already off in eval.
                 _sampling_reference = reference_policy
                 loss_fn = make_dpo_loss_fn(
-                    beta=args.beta,
-                    label_smoothing=args.label_smoothing,
-                    reference_policy=reference_policy,
-                    reference_free=bool(args.reference_free),
+                    objective, reference_policy=reference_policy,
                 )
-                _main_print(f"Unsloth: Using DPO loss (beta={args.beta}).")
+                _main_print(
+                    f"Unsloth: Using DPO loss (beta={args.beta}, "
+                    f"loss_type={list(objective.loss_types)})."
+                )
             self._preference_run_context = PreferenceRunContext(
                 model, enabled=bool(getattr(args, "disable_dropout", True)),
             )
             # Not the training loss: that one normalizes across an accumulation
             # window, where this one normalizes over the split it is given.
             preference_eval_fn = make_preference_eval_fn(
-                preference_kind,
-                beta=args.beta,
-                label_smoothing=getattr(args, "label_smoothing", 0.0),
-                reference_policy=_sampling_reference,
-                reference_free=bool(getattr(args, "reference_free", False)),
+                objective, reference_policy=_sampling_reference,
             )
 
         self.callback_handler.optimizer = optimizer
