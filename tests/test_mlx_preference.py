@@ -789,12 +789,12 @@ def test_microbatch_loss_matches_one_logical_batch(objective):
 
 def test_orpo_odds_term_is_finite_for_perfect_float16_logp():
     import mlx.core as mx
-    from unsloth_zoo.mlx.preference import _orpo_terms
+    from unsloth_zoo.mlx.preference import _log_sigmoid, _orpo_log_odds
 
-    value = _orpo_terms(
+    value = -_log_sigmoid(_orpo_log_odds(
         mx.array([0.0], dtype=mx.float16),
         mx.array([-1.0], dtype=mx.float16),
-    )
+    ))
     assert math.isfinite(float(value[0]))
     assert value.dtype == mx.float32
 
@@ -814,7 +814,7 @@ def test_dpo_label_smoothing_matches_conservative_formula():
         (1 - epsilon) * preference._log_sigmoid(logits)
         + epsilon * preference._log_sigmoid(-logits)
     ).mean()
-    actual, weight = preference.make_dpo_loss_fn(
+    actual, weight, _stats = preference.make_dpo_loss_fn(
         beta=beta, label_smoothing=epsilon, reference_free=True,
     )(model, batch, lengths, normalizers)
     assert float(actual) == pytest.approx(float(expected), rel=1e-6)
@@ -841,15 +841,15 @@ def test_orpo_nll_covers_the_full_chosen_sequence():
     response_logp = -(ce * response_mask).sum(axis=1) / mx.maximum(
         response_mask.sum(axis=1), mx.array(1.0),
     )
-    odds = preference._orpo_terms(
+    odds = -preference._log_sigmoid(preference._orpo_log_odds(
         response_logp[:pairs], response_logp[pairs:],
-    ).mean()
+    )).mean()
     full_mask = (steps < lengths[:pairs, 1:]).astype(mx.float32)
     full_nll = (ce[:pairs] * full_mask).sum() / full_mask.sum()
     response_nll = (
         ce[:pairs] * response_mask[:pairs]
     ).sum() / response_mask[:pairs].sum()
-    actual, _ = preference.make_orpo_loss_fn(beta)(
+    actual, _weight, _stats = preference.make_orpo_loss_fn(beta)(
         model, batch, lengths, normalizers,
     )
     assert float(actual) == pytest.approx(float(full_nll + beta * odds), rel=1e-6)

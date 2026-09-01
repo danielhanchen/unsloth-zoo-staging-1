@@ -1987,6 +1987,19 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
     raise ValueError("max_steps must be > 0 when using streaming mode.")
 
 
+def _preference_metric_values(names, denominators, summed):
+    """Window means from summed numerators and the denominators they name.
+
+    ``summed`` holds every numerator followed by every denominator, so a window
+    or an eval set is averaged exactly however unlike its batches are.
+    """
+    values = {}
+    for index, name in enumerate(names):
+        divisor = summed[denominators[index]]
+        values[name] = summed[index] / divisor if divisor > 0 else 0.0
+    return values
+
+
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
 
@@ -4022,13 +4035,10 @@ class MLXTrainer:
                 if metric_names is None:
                     metrics[f"{prefix}perplexity"] = math.exp(min(value, 100))
                 elif total > 0:
-                    summed = stats.tolist()
-                    for index, name in enumerate(metric_names):
-                        over = metric_denominators.get(index)
-                        divisor = total if over is None else summed[over]
-                        metrics[f"{prefix}{name}"] = (
-                            summed[index] / divisor if divisor > 0 else 0.0
-                        )
+                    for name, metric in _preference_metric_values(
+                        metric_names, metric_denominators, stats.tolist(),
+                    ).items():
+                        metrics[f"{prefix}{name}"] = metric
                 return value
 
             if isinstance(eval_batches, dict):
@@ -5715,24 +5725,34 @@ class MLXTrainer:
                 )
             return grad, toks_f
 
+        def _scored(batch_data):
+            """Loss, its weight, and the metric sums a preference loss reports.
+
+            ``stats`` is None for every objective that reports no metrics of its
+            own, which is every SFT and VLM loss.
+            """
+            scored, grad = _loss_and_grad(batch_data)
+            stats = scored[2] if len(scored) > 2 else None
+            return scored[0], scored[1], stats, grad
+
         def _local_grad_step(batch_data, prev_state):
             """Local loss/grad accumulation step, safe to compile under DDP."""
-            (lvalue, toks), grad = _loss_and_grad(batch_data)
+            lvalue, toks, stats, grad = _scored(batch_data)
             toks_f = toks.astype(mx.float32)
             grad, toks_f = _accumulate_weighted_grad(grad, toks_f, prev_state)
             # Carried as state across loop iterations, or reduced eagerly
             # outside mx.compile under DDP.
             grad = tree_map(mx.stop_gradient, grad)
             toks_f = mx.stop_gradient(toks_f)
-            return lvalue, toks, (grad, toks_f)
+            return lvalue, toks, stats, (grad, toks_f)
 
         # Unified step for VLM (dict batch) and text (tuple batch) training.
         def step_fn(batch_data, prev_state, do_update):
-            (lvalue, toks), grad = _loss_and_grad(batch_data)
+            lvalue, toks, stats, grad = _scored(batch_data)
 
             if _direct_single_step_update:
                 grad_norm = _apply_update_direct(grad, toks.astype(mx.float32))
-                return lvalue, toks, None, grad_norm
+                return lvalue, toks, stats, None, grad_norm
 
             toks_f = toks.astype(mx.float32)
             grad_norm = mx.array(0.0, dtype=mx.float32)
@@ -5740,11 +5760,11 @@ class MLXTrainer:
 
             if do_update:
                 grad_norm = _apply_update(grad, toks_f)
-                return lvalue, toks, None, grad_norm
+                return lvalue, toks, stats, None, grad_norm
 
             grad = tree_map(mx.stop_gradient, grad)
             toks_f = mx.stop_gradient(toks_f)
-            return lvalue, toks, (grad, toks_f), None
+            return lvalue, toks, stats, (grad, toks_f), None
 
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = (
@@ -5827,8 +5847,10 @@ class MLXTrainer:
         _ddp_update_outside_step = distributed_world_size > 1
 
         def _ddp_eager_local_step_fn(batch_data, prev_state, do_update):
-            lvalue, toks, local_state = _local_grad_step(batch_data, prev_state)
-            return lvalue, toks, local_state, None
+            lvalue, toks, stats, local_state = _local_grad_step(
+                batch_data, prev_state,
+            )
+            return lvalue, toks, stats, local_state, None
 
         if _use_compile:
             _uncompiled_step_fn = step_fn
@@ -5885,8 +5907,8 @@ class MLXTrainer:
 
                 def _ddp_compiled_step_fn(batch_data, prev_state, do_update):
                     try:
-                        lvalue, toks, local_state = _compiled_local_grad_step(
-                            batch_data, prev_state,
+                        lvalue, toks, stats, local_state = (
+                            _compiled_local_grad_step(batch_data, prev_state)
                         )
                         mx.eval(
                             _compile_state,
@@ -5894,12 +5916,13 @@ class MLXTrainer:
                             toks,
                             local_state[0],
                             local_state[1],
+                            *(() if stats is None else (stats,)),
                         )
                     except Exception as e:
                         if _is_compile_exception(e):
                             raise _DDPCompiledLocalGradError(str(e)) from e
                         raise
-                    return lvalue, toks, local_state, None
+                    return lvalue, toks, stats, local_state, None
 
                 if _use_compile:
                     step_fn = _ddp_compiled_step_fn
@@ -6975,11 +6998,12 @@ class MLXTrainer:
             nonlocal _compile_fallback_reason
 
             def _eval_local_result(step_result):
-                lvalue, toks, local_state, _grad_norm = step_result
+                lvalue, toks, stats, local_state, _grad_norm = step_result
+                extra = () if stats is None else (stats,)
                 if local_state is not None:
-                    mx.eval(lvalue, toks, local_state[0], local_state[1])
+                    mx.eval(lvalue, toks, local_state[0], local_state[1], *extra)
                 else:
-                    mx.eval(lvalue, toks)
+                    mx.eval(lvalue, toks, *extra)
 
             local_error = None
             compile_error = None
@@ -7298,7 +7322,7 @@ class MLXTrainer:
                 self._distributed_should_stop()
 
             if _ddp_update_outside_step:
-                lvalue, toks, grad_accum_state, grad_norm = _run_ddp_local_step(
+                lvalue, toks, stats, grad_accum_state, grad_norm = _run_ddp_local_step(
                     batch_data, grad_accum_state, do_update,
                 )
                 if do_update:
@@ -7312,7 +7336,7 @@ class MLXTrainer:
                 if _use_compile and not _ddp_compile_local_grad:
                     rng_state_before = _mlx_rng_key()
                 try:
-                    lvalue, toks, grad_accum_state, grad_norm = step_fn(
+                    lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
                         batch_data, grad_accum_state, do_update,
                     )
                 except (ValueError, RuntimeError, TypeError) as e:
@@ -7336,7 +7360,7 @@ class MLXTrainer:
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
                         state = [model.state, optimizer.state, mx.random.state]
-                        lvalue, toks, grad_accum_state, grad_norm = step_fn(
+                        lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,
                         )
                     else:

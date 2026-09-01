@@ -866,41 +866,27 @@ def _orpo_log_odds(chosen, rejected):
     return chosen_odds - rejected_odds
 
 
-def _orpo_terms(chosen, rejected):
-    return -_log_sigmoid(_orpo_log_odds(chosen, rejected))
-
-
 def make_orpo_loss_fn(beta=0.1):
     """Create an ORPO loss with exact logical-window normalization."""
     beta = float(beta)
 
     def loss_fn(model, batch, lengths, normalizers):
-        targets = batch[:, 1:]
-        ce = nn.losses.cross_entropy(
-            _model_logits(model(batch[:, :-1])), targets, reduction="none",
-        ).reshape(targets.shape)
-        mask = _response_mask(targets, lengths)
-        response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
-            mask.sum(axis=1), mx.array(1.0),
+        nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
+            model, batch, lengths, beta,
         )
-        pairs = batch.shape[0] // 2
-        nll_mask = (
-            mx.arange(1, targets.shape[1] + 1) < lengths[:pairs, 1:]
-        ).astype(mx.float32)
-        nll_sum = (ce[:pairs] * nll_mask).sum()
-        odds_sum = _orpo_terms(
-            response_logp[:pairs], response_logp[pairs:],
-        ).sum()
         nll_tokens, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * (
             nll_sum / mx.maximum(nll_tokens, mx.array(1)).astype(mx.float32)
-            + beta * odds_sum / mx.maximum(
+            - beta * ratio.sum() / mx.maximum(
                 window_pairs, mx.array(1),
             ).astype(mx.float32)
         )
-        return loss, mx.array(1, dtype=mx.int32)
+        return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["orpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["orpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["orpo"]
     return loss_fn
 
 
@@ -1005,27 +991,24 @@ def make_dpo_loss_fn(
     epsilon = float(label_smoothing)
 
     def loss_fn(model, batch, lengths, normalizers):
-        policy = _response_logps(model, batch, lengths)
-        pairs = batch.shape[0] // 2
-        if reference_free:
-            reference = mx.zeros(policy.shape, dtype=policy.dtype)
-        else:
-            reference = reference_policy.forward(model, batch, lengths)
-        logits = beta * (
-            (policy[:pairs] - policy[pairs:])
-            - (reference[:pairs] - reference[pairs:])
+        margin, stats = _dpo_scores(
+            model, batch, lengths, beta=beta,
+            reference_policy=reference_policy, reference_free=reference_free,
         )
         pair_loss = -(
-            (1.0 - epsilon) * _log_sigmoid(logits)
-            + epsilon * _log_sigmoid(-logits)
+            (1.0 - epsilon) * _log_sigmoid(margin)
+            + epsilon * _log_sigmoid(-margin)
         )
         _, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * pair_loss.sum() / mx.maximum(
             window_pairs, mx.array(1),
         ).astype(mx.float32)
-        return loss, mx.array(1, dtype=mx.int32)
+        return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["dpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
     return loss_fn
 
 
@@ -1088,19 +1071,101 @@ def _orpo_logit_sum(logits):
     return _row_logit_sum(logits).sum(), mx.array(float(math.prod(logits.shape)))
 
 
-# Metric index -> index of the stats entry it is divided by. Anything absent is
-# a per-pair sum over the pair count. These are means over tokens, which no pair
-# count recovers once batches hold different numbers of them.
+# The denominators summed alongside the metrics, in the order appended.
+_PREFERENCE_DENOMINATOR_NAMES = {
+    "dpo": ("chosen_logits", "rejected_logits", "pairs"),
+    "orpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
+}
+
+# The metrics that are token means; the pair count recovers every other one.
+# These three are also the ones that can disagree with a CUDA log, which they do
+# once a window's batches carry unlike tokens per pair: TRL weights its
+# per-micro-batch means equally, so its number moves with
+# per_device_train_batch_size on identical data -- 13% across batch sizes 1 to 16
+# in one measured window. Summing numerators over the window and dividing by the
+# tokens they cover does not, and is what both paths report here.
+_PREFERENCE_TOKEN_DENOMINATORS = {
+    "dpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+    },
+    "orpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+        "nll_loss": "nll_tokens",
+    },
+}
+
+
+def _preference_denominators(kind):
+    """Metric index -> index of the stats entry it is divided by.
+
+    Derived rather than written out: the indices are positions in a vector whose
+    length changes with the objective, and a hand-maintained map would rot the
+    first time a metric moved.
+    """
+    names = PREFERENCE_EVAL_METRICS[kind]
+    offsets = {
+        name: len(names) + offset
+        for offset, name in enumerate(_PREFERENCE_DENOMINATOR_NAMES[kind])
+    }
+    token_means = _PREFERENCE_TOKEN_DENOMINATORS[kind]
+    return {
+        index: offsets[token_means.get(name, "pairs")]
+        for index, name in enumerate(names)
+    }
+
+
 PREFERENCE_EVAL_DENOMINATORS = {
-    "dpo": {6: 8, 7: 9},
-    "orpo": {6: 11, 7: 12, 8: 13},
+    kind: _preference_denominators(kind) for kind in PREFERENCE_EVAL_METRICS
 }
 
 # Reported metrics, then the denominators the trainer sums alongside them.
 PREFERENCE_EVAL_STATS_WIDTH = {
-    kind: len(names) + len(PREFERENCE_EVAL_DENOMINATORS[kind])
+    kind: len(names) + len(_PREFERENCE_DENOMINATOR_NAMES[kind])
     for kind, names in PREFERENCE_EVAL_METRICS.items()
 }
+
+
+def _preference_stats(
+    kind, logits, mask, *, chosen, rejected, chosen_rewards, rejected_rewards,
+    extra=(), extra_denominators=(),
+):
+    """One batch's metric numerators, then the denominators they divide by.
+
+    Every entry is a sum, so summing over a window and dividing each numerator
+    by the entry its index names averages that window exactly.
+    """
+    pairs = chosen.shape[0]
+    # TRL is inconsistent between its trainers: DPOTrainer averages its logit
+    # metric over completion positions, ORPOTrainer over the whole sequence.
+    if kind == "orpo":
+        chosen_logits, chosen_count = _orpo_logit_sum(logits[:pairs])
+        rejected_logits, rejected_count = _orpo_logit_sum(logits[pairs:])
+    else:
+        chosen_logits, chosen_count = _masked_logit_sum(
+            logits[:pairs], mask[:pairs])
+        rejected_logits, rejected_count = _masked_logit_sum(
+            logits[pairs:], mask[pairs:])
+    values = [
+        chosen_rewards.sum(),
+        rejected_rewards.sum(),
+        (chosen_rewards > rejected_rewards).astype(mx.float32).sum(),
+        (chosen_rewards - rejected_rewards).sum(),
+        chosen.sum(),
+        rejected.sum(),
+        chosen_logits,
+        rejected_logits,
+        *extra,
+        chosen_count,
+        rejected_count,
+        *extra_denominators,
+        mx.array(float(pairs)),
+    ]
+    # Reported, never trained on: the loss is the only path to the gradient.
+    return mx.stop_gradient(
+        mx.stack([value.astype(mx.float32) for value in values])
+    )
 
 
 def _preference_forward(model, batch, lengths):
@@ -1111,6 +1176,57 @@ def _preference_forward(model, batch, lengths):
         logits, targets, reduction="none",
     ).reshape(targets.shape)
     return logits, ce, _response_mask(targets, lengths)
+
+
+def _orpo_scores(model, batch, lengths, beta):
+    """Score one ORPO batch as ``(nll_sum, nll_tokens, ratio, stats)``.
+
+    Unreduced: training normalizes over its window, evaluation over the batch.
+    """
+    logits, ce, mask = _preference_forward(model, batch, lengths)
+    pairs = batch.shape[0] // 2
+    response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
+        mask.sum(axis=1), mx.array(1.0),
+    )
+    chosen, rejected = response_logp[:pairs], response_logp[pairs:]
+    nll_mask = (
+        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
+    ).astype(mx.float32)
+    nll_tokens = nll_mask.sum()
+    nll_sum = (ce[:pairs] * nll_mask).sum()
+    log_odds = _orpo_log_odds(chosen, rejected)
+    ratio = _log_sigmoid(log_odds)
+    stats = _preference_stats(
+        "orpo", logits, mask,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=beta * chosen, rejected_rewards=beta * rejected,
+        extra=(nll_sum, ratio.sum(), log_odds.sum()),
+        extra_denominators=(nll_tokens,),
+    )
+    return nll_sum, nll_tokens, ratio, stats
+
+
+def _dpo_scores(model, batch, lengths, *, beta, reference_policy, reference_free):
+    """Score one DPO batch: the preference margin, then the metrics for the log."""
+    logits, ce, mask = _preference_forward(model, batch, lengths)
+    pairs = batch.shape[0] // 2
+    logps = -(ce * mask).sum(axis=1)
+    if reference_free:
+        reference = mx.zeros(logps.shape, dtype=logps.dtype)
+    else:
+        reference = reference_policy.forward(model, batch, lengths)
+    chosen, rejected = logps[:pairs], logps[pairs:]
+    chosen_rewards = beta * (chosen - reference[:pairs])
+    rejected_rewards = beta * (rejected - reference[pairs:])
+    margin = beta * (
+        (chosen - rejected) - (reference[:pairs] - reference[pairs:])
+    )
+    stats = _preference_stats(
+        "dpo", logits, mask,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=chosen_rewards, rejected_rewards=rejected_rewards,
+    )
+    return margin, stats
 
 
 def make_preference_eval_fn(
@@ -1129,70 +1245,25 @@ def make_preference_eval_fn(
     epsilon = float(label_smoothing)
 
     def eval_fn(model, batch, lengths, _normalizers=None):
-        logits, ce, mask = _preference_forward(model, batch, lengths)
         pairs = batch.shape[0] // 2
-        logps = -(ce * mask).sum(axis=1)
-        # TRL is not consistent between its trainers: DPOTrainer averages its
-        # logit metric over the completion positions only, ORPOTrainer over the
-        # whole sequence. Follow each, so either compares against its own run.
         if kind == "orpo":
-            chosen_logits, chosen_logit_count = _orpo_logit_sum(logits[:pairs])
-            rejected_logits, rejected_logit_count = _orpo_logit_sum(logits[pairs:])
+            nll_sum, nll_tokens, ratio, stats = _orpo_scores(
+                model, batch, lengths, beta,
+            )
+            loss = (
+                nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
+                - beta * ratio.mean()
+            )
         else:
-            chosen_logits, chosen_logit_count = _masked_logit_sum(
-                logits[:pairs], mask[:pairs])
-            rejected_logits, rejected_logit_count = _masked_logit_sum(
-                logits[pairs:], mask[pairs:])
-        if kind == "orpo":
-            logps = logps / mx.maximum(mask.sum(axis=1), mx.array(1.0))
-        chosen, rejected = logps[:pairs], logps[pairs:]
-        if kind == "orpo":
-            nll_mask = (
-                mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
-            ).astype(mx.float32)
-            nll_tokens = nll_mask.sum()
-            nll_sum = (ce[:pairs] * nll_mask).sum()
-            nll = nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
-            log_odds = _orpo_log_odds(chosen, rejected)
-            ratio = _log_sigmoid(log_odds)
-            loss = nll - beta * ratio.mean()
-            chosen_rewards = beta * chosen
-            rejected_rewards = beta * rejected
-            extra = [nll_sum, ratio.sum(), log_odds.sum()]
-            denominators = [
-                chosen_logit_count, rejected_logit_count, nll_tokens,
-            ]
-        else:
-            if reference_free:
-                reference = mx.zeros(logps.shape, dtype=logps.dtype)
-            else:
-                reference = reference_policy.forward(model, batch, lengths)
-            margin = beta * (
-                (chosen - rejected) - (reference[:pairs] - reference[pairs:])
+            margin, stats = _dpo_scores(
+                model, batch, lengths, beta=beta,
+                reference_policy=reference_policy, reference_free=reference_free,
             )
             loss = -(
                 (1.0 - epsilon) * _log_sigmoid(margin)
                 + epsilon * _log_sigmoid(-margin)
             ).mean()
-            chosen_rewards = beta * (chosen - reference[:pairs])
-            rejected_rewards = beta * (rejected - reference[pairs:])
-            extra = []
-            denominators = [chosen_logit_count, rejected_logit_count]
-        stats = [
-            chosen_rewards.sum(),
-            rejected_rewards.sum(),
-            (chosen_rewards > rejected_rewards).astype(mx.float32).sum(),
-            (chosen_rewards - rejected_rewards).sum(),
-            chosen.sum(),
-            rejected.sum(),
-            chosen_logits,
-            rejected_logits,
-        ] + extra + denominators
-        return (
-            loss,
-            mx.array(pairs, dtype=mx.int32),
-            mx.stack([value.astype(mx.float32) for value in stats]),
-        )
+        return loss, mx.array(pairs, dtype=mx.int32), stats
 
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
