@@ -5426,7 +5426,7 @@ class MLXTrainer:
                 model, enabled=bool(getattr(args, "disable_dropout", True)),
             )
             # Not the training loss: that one normalizes across an accumulation
-            # window, and reports none of these metrics.
+            # window, where this one normalizes over the split it is given.
             preference_eval_fn = make_preference_eval_fn(
                 preference_kind,
                 beta=args.beta,
@@ -6294,6 +6294,10 @@ class MLXTrainer:
         supervised_tokens = 0
         pending_supervised_tokens = 0
         pending_steps = 0
+        # The preference metric sums, split the same way; None until a loss
+        # that reports them runs, which an SFT or VLM objective never does.
+        metric_stats = None
+        pending_stats = None
         trained_tokens = 0
         train_time = 0
         # Wall clock for the PENDING window, split like the loss/token counters
@@ -6379,6 +6383,7 @@ class MLXTrainer:
             on_log fires on every rank and self-gates on is_world_process_zero.
             """
             nonlocal losses, n_tokens, supervised_tokens, steps, train_time, trained_tokens
+            nonlocal metric_stats
             # Nothing accumulated since the last log: a callback can force
             # should_log again on a step that already logged, and the accumulators
             # are plain-int 0 after a reset, so .item() below would raise and a real
@@ -6462,6 +6467,17 @@ class MLXTrainer:
             }
             if grad_norm_val is not None:
                 logs["grad_norm"] = grad_norm_val
+            if metric_stats is not None:
+                # TRL's preference trainers log these beside the loss every step.
+                summed_stats = self._distributed_all_sum(
+                    metric_stats, stream=mx.cpu,
+                )
+                mx.eval(summed_stats)
+                logs.update(_preference_metric_values(
+                    loss_fn._unsloth_preference_metrics,
+                    loss_fn._unsloth_preference_denominators,
+                    summed_stats.tolist(),
+                ))
             # HF's Trainer.log stamps the epoch onto every payload, so a persisted
             # log_history entry keeps it after state.epoch has moved on.
             if self.state.epoch is not None:
@@ -6485,6 +6501,7 @@ class MLXTrainer:
             n_tokens = 0
             supervised_tokens = 0
             steps = 0
+            metric_stats = None
             train_time = 0
 
         def _sample_generations(current_step):
@@ -7380,6 +7397,10 @@ class MLXTrainer:
             pending_n_tokens += toks
             pending_supervised_tokens += supervised_toks
             pending_steps += 1
+            if stats is not None:
+                pending_stats = (
+                    stats if pending_stats is None else pending_stats + stats
+                )
             if do_update:
                 # Window applied: fold pending into committed and reset pending.
                 # Evaluating the committed accumulators here materializes the folded
@@ -7399,6 +7420,13 @@ class MLXTrainer:
                 pending_supervised_tokens = 0
                 pending_steps = 0
                 _metric_eval = (losses, n_tokens, supervised_tokens)
+                if pending_stats is not None:
+                    metric_stats = (
+                        pending_stats if metric_stats is None
+                        else metric_stats + pending_stats
+                    )
+                    pending_stats = None
+                    _metric_eval = (*_metric_eval, metric_stats)
             else:
                 # Substep: only the pending window changed; committed is unchanged
                 # (already materialized at its last fold). Both are always arrays at
@@ -7406,6 +7434,8 @@ class MLXTrainer:
                 _metric_eval = (
                     pending_losses, pending_n_tokens, pending_supervised_tokens,
                 )
+                if pending_stats is not None:
+                    _metric_eval = (*_metric_eval, pending_stats)
             # One evaluation boundary: the reported norm (when present) is
             # evaluated together with model/optimizer state and metric
             # accumulators, never as a separate earlier graph execution.
@@ -7520,6 +7550,7 @@ class MLXTrainer:
                         pending_losses = 0
                         pending_n_tokens = 0
                         pending_supervised_tokens = 0
+                        pending_stats = None
                         pending_steps = 0
                         # Drop the abandoned window's time with its tokens, else
                         # the next window's tokens/s is deflated by it.
