@@ -1870,12 +1870,11 @@ def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
 
 
 def test_the_orpo_logit_sum_is_accumulated_in_float32():
-    """ORPO reduces raw logits, so the accumulator dtype is the model's own.
+    """Both objectives reduce raw logits wider than the logits are stored.
 
     mx.sum does not promote, and a batch holds millions of logits: in bf16 the
-    running sum stops registering addends long before the end, and the cast in
-    mx.stack lands after the damage. DPO is safe by construction -- its float32
-    response mask promotes the multiply before the reduction.
+    running sum stops registering addends long before the end, and a cast of the
+    result lands after the damage.
 
     This shim runs in float32, so the assertion is on the dtype rather than on
     the value; only a real-mlx run reproduces the drift itself.

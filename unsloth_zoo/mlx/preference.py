@@ -1050,24 +1050,42 @@ PREFERENCE_EVAL_METRICS = {
 }
 
 
+# Contracted against instead of ones: a matmul returns the input dtype, and a
+# float16 vocabulary row sum runs past 65504 to infinity, which the mask then
+# turns into NaN. The smallest power of two still normal in float16, so undoing
+# it is exact; a 262144-entry vocabulary uses up its headroom near logits of 4096.
+_LOGIT_SUM_SCALE = 2.0 ** -14
+
+
+def _row_logit_sum(logits):
+    """Logit sum at each position, accumulated wider than the logits are stored.
+
+    mx.sum accumulates in the input dtype, which can overflow float16 at a real
+    vocabulary and loses mantissa in bf16. Casting first fixes both but
+    materializes a float32 copy of the largest tensor in the step -- 1.6 GB at
+    batch 4, sequence 2048, vocabulary 49152, since MLX does not fuse the cast
+    into the reduction. Contracting accumulates in float32 inside the matmul
+    instead, for the cost of the per-position result alone, which is then rounded
+    once to the logits' own mantissa.
+    """
+    weights = mx.full(
+        (logits.shape[-1], 1), _LOGIT_SUM_SCALE, dtype = logits.dtype,
+    )
+    return (logits @ weights).astype(mx.float32).squeeze(-1) / _LOGIT_SUM_SCALE
+
+
 def _masked_logit_sum(logits, mask):
     """Logit sum over the response positions, and the count it divides by.
 
     Separate so the eval set's mean is taken over all of its positions at once.
     """
     kept = mask.sum() * logits.shape[-1]
-    # The float32 mask promotes the product, so this reduction is already exact.
-    return (logits * mask[..., None]).sum(), kept
+    return (_row_logit_sum(logits) * mask).sum(), kept
 
 
 def _orpo_logit_sum(logits):
-    """Logit sum over every position, and the count it divides by.
-
-    Cast before reducing: mx.sum accumulates in the input dtype, and a bf16
-    batch holds millions of logits, far past where an 8-bit mantissa stops
-    registering the next addend. Casting the result would already be too late.
-    """
-    return logits.astype(mx.float32).sum(), mx.array(float(math.prod(logits.shape)))
+    """Logit sum over every position, and the count it divides by."""
+    return _row_logit_sum(logits).sum(), mx.array(float(math.prod(logits.shape)))
 
 
 # Metric index -> index of the stats entry it is divided by. Anything absent is
