@@ -1,0 +1,32 @@
+# Staging-only check for the comment reduction pass.
+#
+# This repo rewrites Python source text at runtime, so a comment is not inert:
+# several finders in compiler.py anchor on consecutive lines, and a comment
+# between them suppresses a rewrite that starts firing once the comment is gone.
+# An AST comparison cannot see that, because the source really did only change in
+# its comments. This workflow asserts the rewriters still make the same decisions
+# as main (I1) and remain fixed points (I3).
+name: Trim idempotency
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  idempotency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the check diffs rewriter decisions against origin/main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No install step on purpose: the check execs compiler.py's module body with
+      # the imports dropped, so it runs without torch. Requiring the full stack
+      # would make it unrunnable on exactly the runners that need it.
+      - name: Rewriter decisions unchanged and idempotent
+        run: python scripts/check_trim_idempotency.py --base origin/main
