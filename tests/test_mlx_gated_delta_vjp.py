@@ -392,8 +392,69 @@ def test_kernel_dispatch_guards_partial_threadgroup_rows():
     g = mx.zeros((1, 8, 2))
     ok_v = mx.zeros((1, 8, 2, 16))
     bad_v = mx.zeros((1, 8, 2, 30))
-    assert gv.gated_delta_kernel_supported(q, g, None, ok_v)
-    assert not gv.gated_delta_kernel_supported(q, g, None, bad_v)
+    assert gv.gated_delta_kernel_supported(q, g, None, ok_v, q)
+    assert not gv.gated_delta_kernel_supported(q, g, None, bad_v, q)
+
+
+@pytest.mark.skipif(_HAS_METAL, reason="the off-Metal answer is what is pinned here")
+def test_kernel_support_declines_off_metal_without_touching_the_layout_search():
+    """Off Metal the predicate must answer False, not raise.
+
+    The layout search reads `dtype.size`, which only a real mx.Dtype has, so with
+    it ahead of the device guard a training call under the torch shim died with
+    AttributeError instead of falling back to the ops VJP.
+    """
+    import unsloth_zoo.gated_delta_vjp as gv
+
+    q = mx.zeros((1, 8, 2, 64))
+    k = mx.zeros((1, 8, 2, 64))
+    v = mx.zeros((1, 8, 2, 64))
+    for g in (mx.zeros((1, 8, 2)), mx.zeros((1, 8, 2, 64))):
+        assert gv.gated_delta_kernel_supported(q, g, None, v, k) is False
+
+
+@pytest.mark.skipif(_HAS_METAL, reason="the off-Metal answer is what is pinned here")
+def test_training_call_falls_back_to_ops_vjp_off_metal(monkeypatch):
+    """The whole dispatch, not just the predicate: an open training window off
+    Metal must reach gated_delta_ops_efficient."""
+    import types
+
+    import unsloth_zoo.gated_delta_vjp as gv
+
+    # patch_gated_delta does `from mlx_lm.models import gated_delta`, which reads
+    # the package ATTRIBUTE, so sys.modules alone is not enough to redirect it.
+    package = types.ModuleType("mlx_lm")
+    models = types.ModuleType("mlx_lm.models")
+    module = types.ModuleType("mlx_lm.models.gated_delta")
+    module.gated_delta_update = lambda *args, **kwargs: ("original", None)
+    module.gated_delta_kernel = lambda *args, **kwargs: ("kernel", None)
+    module.compute_g = lambda A_log, a, dt_bias: mx.zeros(a.shape)
+    models.gated_delta = module
+    package.models = models
+    monkeypatch.setitem(sys.modules, "mlx_lm", package)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.gated_delta", module)
+
+    reached = []
+    real_ops = gv.gated_delta_ops_efficient
+    monkeypatch.setattr(
+        gv, "gated_delta_ops_efficient",
+        lambda *args, **kwargs: (reached.append(True), real_ops(*args, **kwargs))[1],
+    )
+    gv.patch_gated_delta()
+
+    q = mx.zeros((1, 8, 2, 64))
+    v = mx.zeros((1, 8, 2, 64))
+    a = mx.zeros((1, 8, 2))
+    acquire_mlx_training_patches()
+    try:
+        module.gated_delta_update(
+            q, q, v, a, a, mx.zeros((2,)), mx.zeros((2,)),
+            state=None, mask=None, use_kernel=True,
+        )
+    finally:
+        release_mlx_training_patches()
+    assert reached, "training call off Metal did not reach the ops VJP"
 
 
 
