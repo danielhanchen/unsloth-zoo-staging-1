@@ -14,6 +14,7 @@ from unsloth_zoo.mlx.attention import (
     _PATCH_TARGETS,
     dequantized_sdpa,
     dequantizing_is_smaller,
+    fused_kernel_exists,
     install_quantized_attention,
     quantized_sdpa_over,
 )
@@ -68,7 +69,7 @@ def _peak(call):
     (32, 8, 128, 128, 4, mx.bfloat16, 82),
     (32, 8, 128, 128, 8, mx.bfloat16, 98),
     (8, 8, 128, 128, 4, mx.bfloat16, 328),
-    (16, 1, 192, 128, 4, mx.bfloat16, 25),   # MLA-shaped: a latent wider than the values
+    (16, 2, 64, 64, 4, mx.bfloat16, 41),     # the narrowest head dim with a fused kernel
     (32, 8, 128, 128, 4, mx.float16, 73),    # both sides at float32, with the result
 ])
 def test_the_query_count_against_the_cache_geometry_decides_the_route(HQ, HKV, D, Dv, bits,
@@ -83,9 +84,35 @@ def test_the_query_count_against_the_cache_geometry_decides_the_route(HQ, HKV, D
     wrapped = quantized_sdpa_over(unfused)
     for L in (1, last, last + 1):
         queries = _queries(1, HQ, L, D, dtype=query_dtype)
-        assert dequantizing_is_smaller(queries, *cache, GS) is (L > last), L
+        assert (dequantizing_is_smaller(queries, *cache, GS)
+                and fused_kernel_exists(queries, *cache, GS)) is (L > last), L
         mx.eval(wrapped(queries, *cache, D ** -0.5, mask="causal", group_size=GS, bits=bits))
     assert taken == [1, last]
+
+
+@pytest.mark.parametrize("D,Dv,group_size", [
+    (256, 256, 64),   # Gemma-2 and Gemma-3: no full kernel at head_dim 256
+    (192, 128, 64),   # MLA-shaped: a latent wider than the values
+    (160, 160, 32),   # not a supported head dim at all
+    (128, 64, 64),    # values narrower than the keys
+])
+def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_size):
+    """Past 8 queries mlx has a full kernel only at head_dim 64/72/80/96/128 with D == Dv; anywhere
+    else it materializes the same scores, so dequantizing on top of them is strictly worse."""
+    cache = _cache(1, 8, 512, D, 4, group_size, Dv=Dv)
+    taken = []
+
+    def unfused(queries, q_keys, q_values, scale, mask, group_size=64, bits=8):
+        taken.append(queries.shape[-2])
+        return mx.zeros((1, 32, queries.shape[-2], Dv))
+
+    wrapped = quantized_sdpa_over(unfused)
+    for L in (16, 1024, 65536):
+        queries = _queries(1, 32, L, D)
+        assert fused_kernel_exists(queries, *cache, group_size) is False, L
+        assert dequantizing_is_smaller(queries, *cache, group_size) is True, L
+        mx.eval(wrapped(queries, *cache, D ** -0.5, "causal", group_size=group_size, bits=4))
+    assert taken == [16, 1024, 65536], "the cost said yes; only the missing kernel declined it"
 
 
 @pytest.mark.parametrize("bits,group_size,last", [(4, 64, 82), (8, 64, 98), (2, 32, 76)])
@@ -93,7 +120,13 @@ def test_the_query_count_against_the_cache_geometry_decides_the_route(HQ, HKV, D
 @pytest.mark.parametrize("runtime", ["mlx_lm", "mlx_vlm"])
 def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, bits, group_size,
                                                                  last):
-    """mlx-vlm runs batched, as its array masks are; those masks also drop every seventh key."""
+    """mlx-vlm runs batched, as its array masks are; those masks also drop every seventh key.
+
+    Both array masks carry a leading 1: `mlx_vlm<0.6.5` -- which is what `mlx-vlm<0.7.0` against
+    this repo's `transformers` cap resolves to -- broadcasts a `[B, 1, L, S]` mask against its own
+    5-D grouped scores only when B is 1. A per-row batched mask above the tie is covered by
+    `test_a_batched_mask_the_pinned_runtime_cannot_broadcast` below.
+    """
     unfused = _runtime(runtime)
     B, HQ, HKV, S, D = (2 if runtime == "mlx_vlm" else 1), 32, 8, 640, 128
     cache = _cache(B, HKV, S, D, bits, group_size)
@@ -105,7 +138,7 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
         else:
             keep = mx.arange(S - L, S)[:, None] >= mx.arange(S)[None]
             keep = keep & (mx.arange(S)[None] % 7 != 3)
-            m = (mx.broadcast_to(keep, (B, 1, L, S)) if mask == "bool"
+            m = (keep[None, None] if mask == "bool"
                  else mx.where(keep, 0.0, -mx.inf).astype(queries.dtype)[None, None])
         call = dict(scale=D ** -0.5, mask=m, group_size=group_size, bits=bits)
         expected = unfused(mx.array(queries), *cache, **call)
@@ -116,6 +149,33 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
             assert mx.array_equal(actual, expected).item(), L
         else:
             assert _divergence(expected, actual) < MAX_DIVERGENCE, L
+
+
+@pytest.mark.parametrize("runtime", ["mlx_lm", "mlx_vlm"])
+def test_a_batched_mask_the_pinned_runtime_cannot_broadcast(runtime):
+    """A per-row `[B, 1, L, S]` mask over grouped heads, which above the tie no longer reaches the
+    runtime. `mlx_lm` 0.31.3 and `mlx_vlm` 0.6.4 both raise on it; the fused kernel takes it as
+    given, so gate on a float32 reference rather than on their answer."""
+    unfused = _runtime(runtime)
+    B, HQ, HKV, S, L, D, bits = 2, 32, 8, 640, 256, 128, 4
+    cache = _cache(B, HKV, S, D, bits)
+    queries = _queries(B, HQ, L, D)
+    keep = mx.arange(S - L, S)[:, None] >= mx.arange(S)[None]
+    rows = mx.arange(B)[:, None, None, None] == 0
+    m = mx.broadcast_to(keep, (B, 1, L, S)) & (rows | (mx.arange(S)[None] % 7 != 3))
+    call = dict(scale=D ** -0.5, mask=m, group_size=GS, bits=bits)
+
+    assert dequantizing_is_smaller(queries, *cache, GS) is True
+    keys = mx.dequantize(*cache[0], group_size=GS, bits=bits).astype(mx.float32)
+    values = mx.dequantize(*cache[1], group_size=GS, bits=bits).astype(mx.float32)
+    keys, values = mx.repeat(keys, HQ // HKV, 1), mx.repeat(values, HQ // HKV, 1)
+    scores = (queries.astype(mx.float32) @ mx.swapaxes(keys, -1, -2)) * D ** -0.5
+    expected = mx.softmax(mx.where(m, scores, mx.finfo(mx.float32).min), axis=-1,
+                          precise=True) @ values
+    actual = quantized_sdpa_over(unfused)(mx.array(queries), *cache, **call)
+    mx.eval(expected, actual)
+    assert actual.shape == expected.shape
+    assert _divergence(expected, actual) < MAX_DIVERGENCE
 
 
 def test_the_transient_is_one_dequantized_cache_not_the_scores():
@@ -156,6 +216,42 @@ def test_the_result_dtype_is_the_one_the_runtime_returns(query_dtype, key_dtype,
     actual = dequantized_sdpa(queries, *cache, **call)
     assert actual.dtype == expected.dtype
     assert _divergence(expected, actual) < MAX_DIVERGENCE
+
+
+@pytest.mark.parametrize("mask_dtype", [mx.bfloat16, mx.float16, mx.float32])
+def test_an_additive_mask_the_fused_kernel_would_reject_stays_on_the_runtime(mask_dtype):
+    """`scores += mask` widens the runtime's result, where the fused kernel refuses any mask that
+    does not promote to its output. Whichever it is, the caller must get the runtime's answer."""
+    unfused = _runtime("mlx_lm")
+    B, HQ, HKV, S, L, D, bits = 1, 32, 8, 256, 128, 128, 4
+    cache = _cache(B, HKV, S, D, bits)
+    queries = _queries(B, HQ, L, D)
+    keep = mx.arange(S - L, S)[:, None] >= mx.arange(S)[None]
+    m = mx.where(keep, 0.0, -mx.inf).astype(mask_dtype)
+    call = dict(scale=D ** -0.5, mask=m, group_size=GS, bits=bits)
+    promotes = mask_dtype == mx.bfloat16
+    assert fused_kernel_exists(queries, *cache, GS, m) is promotes
+    expected = unfused(mx.array(queries), *cache, **call)
+    actual = quantized_sdpa_over(unfused)(mx.array(queries), *cache, **call)
+    mx.eval(expected, actual)
+    assert actual.dtype == expected.dtype, mask_dtype
+    assert _divergence(expected, actual) < MAX_DIVERGENCE
+
+
+def test_an_argument_the_wrapper_predates_goes_to_the_runtime():
+    """A future `sinks=` has no fused equivalent, so it must delegate, not be dropped."""
+    seen = []
+
+    def unfused(queries, q_keys, q_values, scale, mask=None, group_size=64, bits=8, sinks=None):
+        seen.append(sinks)
+        return mx.zeros((1, 32, queries.shape[-2], 128), dtype=queries.dtype)
+
+    cache = _cache(1, 8, 512, 128, 4)
+    wrapped = quantized_sdpa_over(unfused)
+    over_the_tie = _queries(1, 32, 4096, 128)
+    assert dequantizing_is_smaller(over_the_tie, *cache, GS) is True
+    mx.eval(wrapped(over_the_tie, *cache, 128 ** -0.5, "causal", group_size=GS, bits=4, sinks="S"))
+    assert seen == ["S"], "an unknown argument must send the call to the runtime"
 
 
 def test_installing_the_patch_redirects_both_runtimes():
