@@ -566,6 +566,31 @@ jobs:
 
       - name: tests/test_mlx_batching_and_decay.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
+
+      # The three gated-delta files ran in no workflow at all: this lane's list
+      # omitted them and the Apple Silicon lane, which is opt-in behind the `mlx`
+      # label, names only test_qwen35_vjp_metal.py. So the ops VJP, the batched
+      # gradient regression from #776 and the consumer-binding sweep shipped
+      # ungated. They need mlx core plus mlx-lm, not Metal, so they belong here;
+      # the Metal-only halves skip and stay the macOS lane's job.
+      - name: tests/test_mlx_gated_delta.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta.py -v -rs
+
+      - name: tests/test_mlx_gated_delta_vjp.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_vjp.py -v -rs
+
+      - name: tests/test_mlx_gated_delta_batch_grad.py
+        # Gradient parity vs plain autodiff at B >= 2. Every test here needs the
+        # real runtime, so under the torch shim the file skips wholesale -- which
+        # is exactly what the gate below refuses to accept as a pass.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -v -rs
+
+      - name: Fail if the gated-delta gradient tests skipped
+        run: |
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -q -rs | tee gd.txt
+          if ! grep -qiE '[1-9][0-9]* passed' gd.txt; then
+            echo "real mlx is installed but no gated-delta gradient test ran"; exit 1
+          fi
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults.
   #
