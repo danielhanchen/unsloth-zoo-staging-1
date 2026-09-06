@@ -28,8 +28,8 @@ def _result_dtype(queries, q_keys, q_values):
 
 
 def _row_bytes(q_cache, group_size, dtype):
-    # Dequantized plus packed: a prefix view is compacted before it is read. Charged always,
-    # since contiguity is not visible from the arrays and views are the common case.
+    # Dequantized plus packed: a prefix view is compacted first, and contiguity is not visible
+    # from the arrays, so the compaction is charged always.
     packed = sum(part.shape[-1] * part.dtype.size for part in q_cache)
     return q_cache[1].shape[-1] * group_size * dtype.size + packed
 
@@ -44,11 +44,8 @@ def dequantizing_is_smaller(queries, q_keys, q_values, group_size):
     return scores > copy
 
 
-# The head dims mlx actually has a kernel for, transcribed from
-# `ScaledDotProductAttention::use_fallback` (mlx/backend/metal/scaled_dot_product_attention.cpp)
-# against the `mlx==0.32.1` pin. Anywhere else `mx.fast.scaled_dot_product_attention` takes its own
-# fallback, which builds the very `[B, HQ, L, S]` scores this module exists to avoid -- so
-# dequantizing there would pay for the copy on top of them rather than instead of them.
+# Elsewhere mlx falls back and builds the scores anyway, so the copy would cost extra rather
+# than instead. ScaledDotProductAttention::use_fallback, mlx 0.32.1.
 _FUSED_FULL_HEAD_DIMS = frozenset((64, 72, 80, 96, 128))
 _FUSED_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 256))
 
@@ -56,8 +53,7 @@ _FUSED_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 256))
 def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     """Whether mlx will really fuse this call. Reachable today at `head_dim` 256 (Qwen3-Next)."""
     if isinstance(mask, mx.array) and mx.issubdtype(mask.dtype, mx.floating):
-        # An additive mask that does not promote to the result is rejected outright by the fused
-        # kernel, where the runtime's `scores += mask` widens the scores to it and carries on.
+        # The fused kernel rejects such a mask; the runtime widens the scores instead.
         dtype = _result_dtype(queries, q_keys, q_values)
         if mx.result_type(mask.dtype, dtype) != dtype:
             return False
@@ -72,8 +68,8 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
 
 
 def dequantized_sdpa(queries, q_keys, q_values, scale, mask=None, group_size=64, bits=8):
-    """The fused kernel over one dequantized copy. A row the mask empties gets the same average
-    the unfused path gives it: mlx masks with a finite minimum, not with -inf."""
+    """The fused kernel over one dequantized copy. An emptied row averages, as the unfused path
+    does: mlx masks with a finite minimum, not -inf."""
     dtype = _result_dtype(queries, q_keys, q_values)
     keys = mx.dequantize(*q_keys, group_size=group_size, bits=bits).astype(dtype)
     values = mx.dequantize(*q_values, group_size=group_size, bits=bits).astype(dtype)
@@ -85,8 +81,7 @@ def quantized_sdpa_over(unfused):
     @functools.wraps(unfused)
     def quantized_sdpa(queries, q_keys, q_values, scale, mask=None, group_size=64, bits=8,
                        **kwargs):
-        # An argument this wrapper predates (a future `sinks=`) has no fused equivalent here, so
-        # the runtime's own function takes the call rather than the argument being dropped.
+        # An argument this wrapper predates has no fused equivalent: delegate, never drop it.
         if (not kwargs
                 and fused_kernel_exists(queries, q_keys, q_values, group_size, mask)
                 and dequantizing_is_smaller(queries, q_keys, q_values, group_size)):
