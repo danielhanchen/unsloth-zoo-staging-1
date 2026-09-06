@@ -245,7 +245,6 @@ class MoeExperts4bit(nn.Module):
             current_hidden_states = self.act_fn(gate) * up
             current_hidden_states = self._matmul_4bit(current_hidden_states, down_weight)
 
-            # Apply routing weights and scatter back
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(
                 0, token_idx, current_hidden_states
@@ -274,7 +273,6 @@ class MoeExperts4bit(nn.Module):
                 down_4bit.data if keep_vars else down_4bit.data.detach()
             )
 
-            # Save quant state components
             if hasattr(gate_up_4bit, 'quant_state') and gate_up_4bit.quant_state is not None:
                 for k, v in gate_up_4bit.quant_state.as_dict(packed=True).items():
                     destination[f"{gate_up_prefix}weight.{k}"] = v if keep_vars else v.detach()
@@ -309,7 +307,6 @@ def replace_with_bnb_moe_experts(
 
     has_been_replaced = False
 
-    # Default quantization settings
     compute_dtype = torch.bfloat16
     compress_statistics = True
     quant_type = "nf4"
@@ -321,13 +318,12 @@ def replace_with_bnb_moe_experts(
         quant_type = getattr(quantization_config, 'bnb_4bit_quant_type', 'nf4')
         quant_storage = getattr(quantization_config, 'bnb_4bit_quant_storage', torch.uint8)
 
-    # Find all MoE expert modules
     for module_name, module in list(model.named_modules()):
         if hasattr(module, 'experts') and hasattr(module.experts, 'gate_up_proj'):
             experts = module.experts
 
             if getattr(experts, '_is_bnb_4bit', False):
-                continue  # already quantized
+                continue
 
             gate_up_proj = experts.gate_up_proj
             num_experts = gate_up_proj.shape[0]
@@ -404,7 +400,6 @@ def quantize_moe_experts_inplace(model: nn.Module, verbose: bool = True) -> int:
             if verbose:
                 print(f"Unsloth: Quantizing {name}.experts to 4-bit...")
 
-            # Create new quantized module and copy weights
             new_experts = quantized_cls(
                 num_experts=experts.gate_up_proj.shape[0],
                 hidden_dim=experts.gate_up_proj.shape[2],

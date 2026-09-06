@@ -498,7 +498,7 @@ def patch_gpt_oss():
                     blocks.device.type != "meta"
                     and scales.device.type != "meta"
                     and blocks.numel() > 0
-                    and blocks.any()  # At least some non-zero values
+                    and blocks.any()
                 )
                 if blocks_valid:
                     # need it for ep
@@ -536,7 +536,6 @@ def patch_gpt_oss():
                         PrecisionConfig(weight_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData())),
                     )
 
-                    # delete blocks and scales
                     delattr(module, scales_attr)
                     delattr(module, blocks_attr)
                     # setattr(module, blocks_attr, torch.nn.Parameter(triton_weight_tensor.storage.data, requires_grad=False))
@@ -1191,7 +1190,6 @@ def patch_gpt_oss_bnb4bit():
     except Exception as e:
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss", e)
 
-    # Store original classes for restoration
     if not hasattr(transformers.models.gpt_oss.modeling_gpt_oss, '_original_GptOssExperts'):
         transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssExperts = \
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssExperts
@@ -1315,7 +1313,6 @@ def _invalidate_gpt_oss_compiled_module():
                         os.remove(_pyc)
                 except Exception:
                     pass
-        # Forget any cached finder/directory state for these paths.
         try:
             importlib.invalidate_caches()
         except Exception:
@@ -1441,7 +1438,6 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
 @_torch_compile(dynamic=None, fullgraph=True, options=fused_torch_compile_options)
 def moe_forward_inference(self, hidden_states):
     """Torch compile for forward inference path only with CUDAGraphs"""
-    # Router
     router_out = self.router(hidden_states)
     if isinstance(router_out, tuple) and len(router_out) == 3:
         _, router_scores, router_indices = router_out
@@ -2583,7 +2579,6 @@ def patch_GptOssModel():
 
     pass
 
-    # RMSNorm forward
     def rms_layernorm_forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
@@ -2940,7 +2935,6 @@ def encode_conversations_with_harmony(
 
     convos = []
 
-    # Create system message
     import datetime
 
     today = datetime.datetime.today().strftime("%Y-%m-%d")
@@ -2954,7 +2948,6 @@ def encode_conversations_with_harmony(
     )
     convos.append(system)
 
-    # Developer message and tool calling
     dev = DeveloperContent.new()
     if developer_instructions is not None: dev = dev.with_instructions(developer_instructions)
     if tool_calls is not None:
@@ -3001,7 +2994,6 @@ def encode_conversations_with_harmony(
             convos.append(x)
     pass
 
-    # Create Harmony conversations
     convos = Conversation.from_messages(convos)
     if add_generation_prompt:
         harmony_input_ids = harmony_encoding.render_conversation_for_completion(convos, Role.ASSISTANT)
@@ -3347,7 +3339,6 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
             RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
             if not RETURN_HIDDEN_STATES:
-                # Normal forward pass
                 return _original_causal_lm_forward(
                     self,
                     input_ids=input_ids,

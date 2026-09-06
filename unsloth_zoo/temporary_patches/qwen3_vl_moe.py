@@ -104,7 +104,6 @@ def patch_qwen3_vl_moe():
                 device=hidden_states.device,
             )
 
-            # One-hot encode selected experts into an expert mask
             expert_mask = torch.nn.functional.one_hot(
                 selected_experts, num_classes=self.num_experts
             ).permute(2, 1, 0)
@@ -159,7 +158,6 @@ def patch_qwen3_vl_moe():
                 device=hidden_states.device,
             )
 
-            # Loop over all available experts
             for expert_idx in range(self.num_experts):
                 expert_layer = self.experts[expert_idx]
                 token_idx, _ = torch.where(selected_experts == expert_idx)
@@ -376,7 +374,6 @@ def patch_qwen3_vl_moe():
             )
 
             if not RETURN_HIDDEN_STATES:
-                # Normal forward pass
                 return _original_causal_lm_forward(
                     self,
                     input_ids=input_ids,

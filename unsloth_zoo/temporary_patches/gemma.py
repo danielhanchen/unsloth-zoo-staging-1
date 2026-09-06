@@ -520,7 +520,6 @@ def patch_Gemma3ForConditionalGeneration_causal_mask():
             causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
             mask_length = attention_mask.shape[-1]
 
-            # Then apply padding mask (will mask pad tokens)
             padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :].to(causal_mask.device)
             padding_mask = padding_mask == 0
             causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
@@ -848,7 +847,7 @@ def patch_Gemma3Attention():
                 scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
                 enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
             )
-            attn_weights = None # Defaulting to None
+            attn_weights = None
 
         # 7. Reshape and downcast for output projection.
         # SDPA returns (bsz, heads, q_len, head_dim) needing transpose;
@@ -1098,7 +1097,7 @@ def patch_Gemma3Attention_generic():
                 scale = getattr(self, "scaling", None), # Use self.scaling if defined, else SDPA default
                 enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
             )
-            attn_weights = None # Defaulting to None
+            attn_weights = None
 
         # 7. Reshape and downcast for output projection.
         # SDPA returns (bsz, heads, q_len, head_dim) needing transpose;

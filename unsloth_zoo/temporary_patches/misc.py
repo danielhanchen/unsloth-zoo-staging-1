@@ -132,7 +132,6 @@ def patch_merge_quantization_configs():
     except Exception as e:
         return raise_error("transformers.quantizers.auto.AutoHfQuantizer.merge_quantization_configs", e)
 
-    # Fast return if already patched
     unique_name = _get_unique_storage_name(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs")
     if hasattr(transformers.quantizers.auto.AutoHfQuantizer, unique_name): return
 
@@ -149,7 +148,6 @@ def patch_merge_quantization_configs():
 
     exec("from transformers.quantizers.auto import (" + ",".join(x for x in items if x in source) + ")", globals())
     source = dedent(source)
-    # Remove cls if classmethod
     is_classmethod = source.startswith("@classmethod")
     source = source[source.find("def"):]
     if is_classmethod:
@@ -348,7 +346,6 @@ def patch_CsmForConditionalGeneration_forward():
         depth_decoder_loss = None
         depth_decoder_outputs = None
         if labels is not None:
-            # select first codebook as labels for the backbone model
             backbone_labels = labels[:, :, 0]
             backbone_loss = self.loss_function(
                 logits=backbone_logits, labels=backbone_labels, vocab_size=self.config.vocab_size, **kwargs
@@ -961,7 +958,7 @@ def patch_causal_conv1d_cuda_probe():
     pass
 
     if causal_conv1d_fn is None:
-        return  # Already nullified
+        return
     pass
 
     if not torch.cuda.is_available():
@@ -1790,11 +1787,9 @@ def patch_trl_vision_model_mapping():
         import transformers.models.auto.modeling_auto as auto_mod
     except ImportError:
         return
-    # If the old name already exists and is populated, nothing to do
     existing = getattr(auto_mod, "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES", None)
     if existing is not None and len(existing) > 0:
         return
-    # Inject the old name as alias of the new name
     new_mapping = getattr(auto_mod, "MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES", None)
     if new_mapping is not None:
         auto_mod.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES = new_mapping
@@ -1909,7 +1904,6 @@ def patch_qwen2vl_image_processor_pixel_attrs():
     except ImportError:
         return
 
-    # Only add shims if not already present as a class-level descriptor
     if not isinstance(Qwen2VLImageProcessor.__dict__.get("max_pixels"), property):
         @property
         def _max_pixels(self):

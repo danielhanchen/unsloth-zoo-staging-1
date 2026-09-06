@@ -116,14 +116,13 @@ def patch_Gemma3nTextAltUp_predict():
         # permute hidden_states to [batch_size, num_tokens, hidden_size, altup_num_inputs]
         predictions = torch.matmul(hidden_states.permute(1, 2, 3, 0), all_coefs)
         predictions = predictions.permute(3, 0, 1, 2)  # undo the permute
-        predictions += hidden_states  # add the original input
+        predictions += hidden_states
         return predictions.contiguous().type_as(hidden_states)
     pass
     patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nTextAltUp, "predict", predict, fullgraph = True)
 pass
 
 def patch_Gemma3nConv_Embed_forwards():
-    # helper function to patch both forwards
     try:
         patch_Gemma3nConvNormAct_forward()
         patch_Gemma3nMultimodalEmbedder_forward()

@@ -60,9 +60,7 @@ __all__ = [
 ]
 
 
-# ============================================================================
 # Detection
-# ============================================================================
 
 def _is_bnb4bit_param(param) -> bool:
     """True iff `param` is a Params4bit with a populated quant_state."""
@@ -92,9 +90,7 @@ def _is_expert_module(module: nn.Module) -> bool:
     )
 
 
-# ============================================================================
 # Dequantization
-# ============================================================================
 
 def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """Dequantize a packed Params4bit MoE expert to its logical 3D shape at
@@ -109,9 +105,7 @@ def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     return dequant.to(target_dtype)
 
 
-# ============================================================================
 # Forward dispatcher
-# ============================================================================
 
 _LOGGED_BACKENDS = set()
 

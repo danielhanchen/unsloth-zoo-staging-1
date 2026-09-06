@@ -111,7 +111,6 @@ def patch_convert_moe_packed_tensors():
         rows_per_chunk: int = 32768 * 1024,
     ) -> torch.Tensor:
         """Dequantize mxfp4 weights into GPT_OSS-compatible form (GPU path)."""
-        # Move CPU tensors to GPU if available.
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
@@ -275,7 +274,6 @@ def patch_convert_moe_packed_tensors():
         rows_per_chunk default 1M rows; per-chunk memory at B=128: 8192 ~22 MB,
         1M ~2.6 GB, 32M ~90 GB.
         """
-        # Force tensors onto CPU.
         if blocks.is_cuda:
             blocks = blocks.cpu()
         if scales.is_cuda:

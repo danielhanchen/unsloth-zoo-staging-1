@@ -60,7 +60,6 @@ from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compi
 EMPTY = inspect._empty
 
 def raise_error(f: str, exception: Any = None):
-    # Raises error only if logging is on
     if UNSLOTH_ENABLE_LOGGING:
         logger.error(
             f"==================\n"\
@@ -86,7 +85,6 @@ def process_return(
             return_dict = {key : return_dict[key] for key in chosen_keys}
         return output_class(**return_dict)
     except:
-        # We inspect the argument then only allow those arguments
         return_dict_keys = return_dict.keys()
         allowed_keys = set(inspect.signature(output_class).parameters.keys())
         chosen_keys  = allowed_keys & return_dict_keys
@@ -389,7 +387,6 @@ def process_output_options(
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else getattr(self.config, "output_hidden_states", False)
     )
-    # Move to kwargs
     kwargs["output_attentions"]    = output_attentions
     kwargs["output_hidden_states"] = output_hidden_states
     return kwargs
@@ -448,7 +445,6 @@ except:
         )
 pass
 
-# Get Cache
 Cache = t.Any
 try: from transformers.cache_utils import Cache
 except: pass
@@ -586,7 +582,6 @@ def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
         param_kind = param.kind.value # 4 is type VAR_KEYWORD **kwargs
         annotation = param.annotation
 
-        # Canonicalize any **kwargs name to "kwargs".
         if "kwargs" in param_name.lower():
             param_name = "kwargs"
             # Default the annotation when untyped.
@@ -607,7 +602,7 @@ def get_function_fingerprint(func: Callable) -> List[Dict[str, Any]]:
         fingerprint.append({
             'name': param_name,
             'kind': param_kind,
-            'is_required': param.default is EMPTY, # True = required
+            'is_required': param.default is EMPTY,
             'annotation' : canonicalize_annotation(annotation),
         })
     return fingerprint
@@ -703,7 +698,6 @@ def can_safely_patch(
         if new_param['is_required'] and not old_param['is_required']:
             return False, f"Parameter '{new_param['name']}' changed from optional to required"
 
-        # Strict matching also compares type annotations.
         if match_level == "strict" and old_param['annotation'] != new_param['annotation']:
             return False, \
             f"Parameter '{old_param['name']}' type annotation changed from:\n"\
@@ -2188,7 +2182,6 @@ def patch_function(
 
     original_func = getattr(target_obj, attr_name)
 
-    # torch.compile if requested.
     if fullgraph is not None and type(fullgraph) is bool and not UNSLOTH_COMPILE_DISABLE:
         # Unwrap already-compiled functions. The shared helper rather than a
         # bare `.__wrapped__`: a carrier without one (an `OptimizedModule`, say)
@@ -2286,7 +2279,6 @@ def patch_function_past_key_values(
         except Exception as e:
             error = str(e)
             continue
-        # Check if either is provided
         for key in ("past_key_value", "past_key_values",):
             if key in new_keys and key in old_keys:
                 try:

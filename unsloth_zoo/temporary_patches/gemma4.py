@@ -465,7 +465,6 @@ def _gemma4_force_nonreentrant_checkpointing(model):
             pass
     for layer in layers:
         try:
-            # Only override when this layer is actually being checkpointed.
             if not getattr(layer, "gradient_checkpointing", False):
                 continue
             # Preserve the layer's existing checkpoint kwargs (preserve_rng_state, context_fn,
@@ -999,7 +998,6 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
 
 
-# ============================================================================
 # Gemma-4 vision pooler float16 overflow fix (transformers 5.5.0 - 5.9.x and
 # the yanked 5.10.0; fixed upstream in >= 5.10.1 by PR #46277).
 #
@@ -1025,7 +1023,6 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextMLP)
 # release including the yanked 5.10.0: fixed sources skip, unknown (future
 # drift) sources are left untouched, transformers without gemma4 no-ops via
 # ImportError. The pooler runs eager, so no compiler-cache companion is needed.
-# ============================================================================
 
 def _gemma4_vision_pooler_status(pooler_cls):
     """Classify Gemma4VisionPooler.forward source: "buggy" (dtype-preserving

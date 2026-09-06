@@ -792,12 +792,10 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     return _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weights)
 
 
-# ============================================================================
 # Save-side hooks: dequant base FP8 weights before LoRA merge, requant after.
 # saving_utils.py consults `_MOE_QUANT_HANDLERS` for every expert weight key
 # it reads, so the FP8 plumbing stays local to this file instead of polluting
 # the generic save path.
-# ============================================================================
 
 # FP8 e4m3 max representable magnitude — matches transformers' Fp8Quantize.convert
 # (finegrained_fp8.py:838-859) and compressed-tensors' fp8 encode path.
@@ -965,10 +963,7 @@ def apply_moe_quant_load(file, header_metadata, key, block_size = None):
     return file.get_tensor(key), None
 
 
-# ============================================================================
 # Hook FP8 experts dispatch + relax HF Trainer FP8 guard
-# ============================================================================
-#
 # transformers swaps a model's experts class with FP8Experts at load time when
 # the checkpoint is FP8 (compressed-tensors / finegrained_fp8). The per-arch
 # patch (patch_qwen3_moe etc.) targets the original Qwen3MoeExperts class, so

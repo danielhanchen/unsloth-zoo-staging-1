@@ -1731,7 +1731,6 @@ def forward_native_grouped_mm(
         gate = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
         up = _grouped_mm_with_backward_fix(permuted_input, w3, offsets)
 
-        # Add LoRA for w1 and w3 separately if present.
         if use_separated_lora:
             if _has_lora_adapters(self.w1):
                 w1_lora = _extract_lora_weights(self.w1, experts_module=self)
@@ -1759,7 +1758,6 @@ def forward_native_grouped_mm(
     else:
         raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
 
-    # Activation
     if "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
@@ -1845,7 +1843,6 @@ def forward_native_grouped_mm(
             try:
                 lora_delta = _grouped_mm_with_backward_fix(lora_out, second_weight, offsets)
             except RuntimeError:
-                # Manual loop fallback.
                 lora_delta = torch.empty(
                     (lora_out.shape[0], second_weight.shape[-1]),
                     dtype=lora_out.dtype,
@@ -1885,7 +1882,6 @@ def forward_native_grouped_mm(
     else:
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
 
-    # Apply routing weights and scatter-add (reduce).
     if _gategrad:
         # Gate grad comes from the identity; detach so the multiply does not pin Y.
         mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
@@ -1957,7 +1953,6 @@ def forward_triton_grouped_gemm(
     if self._unsloth_moe_configs is None:
         intermediate_dim = self.gate_up_proj.shape[1] // 2
 
-        # Autotune first GEMM.
         gemm1_configs = get_or_autotune_moe_kernels(
             num_experts=self.num_experts,
             hidden_dim=hidden_dim,
@@ -1992,7 +1987,6 @@ def forward_triton_grouped_gemm(
     else:
         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
 
-    # First grouped GEMM: gate_up projection.
     first_gemm_output = grouped_gemm(
         X=hidden_states,
         W=w1,
@@ -2026,14 +2020,12 @@ def forward_triton_grouped_gemm(
         )
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
-    # Activation + gate*up.
     if hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
     else:
         intermediate = _silu_and_mul(first_gemm_output)
 
-    # Grouped GEMM 2: down projection.
     down_lora = None
     if getattr(self, "_unsloth_lora_down_proj", None) is not None:
         down_lora = self._unsloth_lora_down_proj[:3]
@@ -2148,7 +2140,6 @@ def forward_native_moe_loop(
             _down_scaling,
         )
 
-    # Expert mask -> which experts have tokens.
     with torch.no_grad():
         expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
         expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
@@ -2202,7 +2193,6 @@ def forward_native_moe_loop(
         else:
             current_hidden_states = F.silu(gate) * up
 
-        # down projection for this expert.
         if hasattr(self, "down_proj"):
             down_weight = self.down_proj[expert_idx]
             # Mirror gate_up: prefer the flag over the shape heuristic (unsafe at square dims).
