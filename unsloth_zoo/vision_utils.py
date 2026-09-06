@@ -428,7 +428,6 @@ def fetch_image(
         image = image_obj.convert("RGB")
     else:
         image = image_obj
-    ## resize
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = smart_resize(
             ele["resized_height"],
@@ -529,26 +528,22 @@ def calculate_video_frame_range(
     'video_start'/'video_end' (seconds). Raises ValueError on invalid params
     or an inconsistent time range.
     """
-    # Validate essential parameters
     if video_fps <= 0:
         raise ValueError("video_fps must be a positive number")
     if total_frames <= 0:
         raise ValueError("total_frames must be a positive integer")
 
-    # Get start and end time in seconds
     video_start = ele.get("video_start", None)
     video_end = ele.get("video_end", None)
     if video_start is None and video_end is None:
         return 0, total_frames - 1, total_frames
 
     max_duration = total_frames / video_fps
-    # Process start frame
     if video_start is not None:
         video_start_clamped = max(0.0, min(video_start, max_duration))
         start_frame = math.ceil(video_start_clamped * video_fps)
     else:
         start_frame = 0
-    # Process end frame
     if video_end is not None:
         video_end_clamped = max(0.0, min(video_end, max_duration))
         end_frame = math.floor(video_end_clamped * video_fps)
@@ -556,7 +551,6 @@ def calculate_video_frame_range(
     else:
         end_frame = total_frames - 1
 
-    # Validate frame order
     if start_frame >= end_frame:
         raise ValueError(
             f"Invalid time range: Start frame {start_frame} (at {video_start_clamped if video_start is not None else 0}s) "
@@ -1178,7 +1172,6 @@ class UnslothVisionDataCollator:
         for example in examples:
             messages = self._select_messages_or_raw(example)
 
-            # Check if data format is correct for VLMs!
             if len(messages) != 0:
                 messages = self._validate_and_normalize_first_message(messages)
 
@@ -1209,7 +1202,6 @@ class UnslothVisionDataCollator:
             audio = self._extract_audio_for_example(example, messages)
             audios.extend(audio)
 
-        # Tokenize the texts and process the images
         # When audio is present, omit max_length/truncation from the top-level processor
         # call — passing them at top-level causes _merge_kwargs to broadcast them into
         # audio_kwargs, which makes the audio feature extractor truncate the waveform to
@@ -1251,7 +1243,6 @@ class UnslothVisionDataCollator:
         if 'pixel_values_videos' in batch:
             batch = self._cast_pixel_values_dtype_inplace(batch, 'pixel_values_videos')
 
-        # Mask image tokens and pad tokens
         labels = batch["input_ids"].clone()
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
@@ -1665,7 +1656,6 @@ class UnslothVisionDataCollator:
         for ex in examples:
             p, c = ex["prompt"], ex["completion"]
 
-            # Determine chat vs plain for each side
             is_p_msgs = isinstance(p, list) and (len(p) == 0 or isinstance(p[0], dict))
             is_c_msgs = isinstance(c, list) and (len(c) == 0 or isinstance(c[0], dict))
 
@@ -1691,7 +1681,6 @@ class UnslothVisionDataCollator:
             else:
                 c_txt = str(c)
 
-            # Images: prefer embedded; else first top-level image; else []
             imgs, vids, vids_kwarg = self._extract_images_for_pc(ex, p if is_p_msgs else None, c if is_c_msgs else None)
             imgs = self._resize_images_inplace(imgs)
 
@@ -1758,7 +1747,6 @@ class UnslothVisionDataCollator:
         else:
             token_type_ids = None
 
-        # Flush to tokenizer default padding side
         pad_id = self._pad_token_id_or_fail()
         flush_side = self._tokenizer_padding_side()
         if token_type_ids is not None:
@@ -1766,13 +1754,11 @@ class UnslothVisionDataCollator:
                 attention_mask, input_ids, flush_side, pad_id, (completion_mask, token_type_ids)
             )
 
-            # Truncate with side awareness
             if self.max_seq_length is not None:
                 input_ids, attention_mask, completion_mask, token_type_ids = self._truncate_by_side(
                     input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length, token_type_ids=token_type_ids
                 )
 
-            # Optional pad-to-multiple-of (manual in PC)
             if self.pad_to_multiple_of and self.pad_to_multiple_of > 1:
                 input_ids, attention_mask, completion_mask, token_type_ids = self._pad_to_multiple(
                     input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of, token_type_ids=token_type_ids
@@ -1782,7 +1768,6 @@ class UnslothVisionDataCollator:
                 attention_mask, input_ids, flush_side, pad_id, (completion_mask,)
             )
 
-            # Truncate with side awareness
             if self.max_seq_length is not None:
                 input_ids, attention_mask, completion_mask = self._truncate_by_side(
                     input_ids, attention_mask, completion_mask, flush_side, self.max_seq_length
@@ -1793,7 +1778,6 @@ class UnslothVisionDataCollator:
                     input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of
                 )
 
-        # Labels: mask attention pads + image/pad tokens; completion-only if requested
         labels = input_ids.clone()
         labels[attention_mask == 0] = self.ignore_index
         padding_ids = self._get_padding_token_ids_on_device(labels.device)

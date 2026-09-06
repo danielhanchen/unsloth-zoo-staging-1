@@ -125,7 +125,6 @@ def _calculate_n_gradient_checkpoints(
     size = n_layers // n_checkpoints
     sizes = np.full(n_checkpoints, size, dtype = int)
     leftovers = n_layers % n_checkpoints
-    # Append leftovers from the right
     for k in range(leftovers):
         sizes[n_checkpoints-1-k] += 1
     boundaries = np.hstack((0, np.cumsum(sizes)))
@@ -644,7 +643,6 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             CPU_BUFFERS.append(x)
     pass
 
-    # Allocate one buffer per GPU
     n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
@@ -808,7 +806,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFERS_B = None
                         pass
 
-                        # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
                                 x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
@@ -834,7 +831,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFER.resize_(new_size)
                                 else:
                                     raise
-                        # Resize buffer B when double buffering; disable + free B on OOM
                         if USE_DOUBLE_BUFFER:
                             GPU_BUFFER_B = GPU_BUFFERS_B[device_index]
                             if new_size > GPU_BUFFER_B.numel():
@@ -904,7 +900,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 " or call .backward() without passing the `inputs` argument."
             )
 
-        # Copy the list to avoid modifying original list.
         inputs = list(ctx.inputs)
         tensor_indices = ctx.tensor_indices
         tensors = ctx.saved_tensors
@@ -916,7 +911,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             global GPU_BUFFERS_B
             global BUFFER_EVENTS_A
             global BUFFER_EVENTS_B
-            # Select buffer from per-device buffer_slot
             if USE_DOUBLE_BUFFER and buffer_slot == 1:
                 buffer = GPU_BUFFERS_B[device_index][:new_size].view(shape)
             else:
@@ -926,23 +920,19 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
-                # Wait for the last compute on THIS buffer to finish
                 event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
                 EXTRA_STREAM.wait_event(event_buffer[device_index])
             else:
-                # Single buffer mode: wait for MAIN_STREAM
                 EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
             # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
             with torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
         else:
-            # No GPU buffer seen
             if len(tensor_indices) != 0:
                 inputs[tensor_indices[0]] = tensors[0]
         pass
 
-        # Fill in inputs with appropriate saved tensors.
         for i, idx in enumerate(tensor_indices[1:], start = 1):
             inputs[idx] = tensors[i]
         pass
@@ -954,8 +944,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         global CURRENT_GC_INDEX
         CURRENT_GC_INDEX = 0
 
-        # Stash the surrounding rng state, mimic the forward state, then
-        # restore the surrounding state when done.
         rng_devices = []
         if ctx.preserve_rng_state and ctx.had_device_in_fwd:
             rng_devices = ctx.fwd_devices
@@ -998,7 +986,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
 
-        # run backward() with only tensor that requires grad
         outputs_with_grad = []
         args_with_grad = []
         for i in range(len(outputs)):
@@ -1026,7 +1013,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             inp.grad if isinstance(inp, torch.Tensor) else None
             for inp in detached_inputs
         )
-        # Clear all memory
         for i in range(len(detached_inputs)):
             detached_inputs[i] = None
             inputs[i] = None
@@ -1219,7 +1205,6 @@ def reset_unsloth_gradient_checkpointing_buffers():
     if len(CPU_BUFFERS) == 0:
         return
 
-    # Reset CPU buffers to initial size; free any added during training
     for i in range(len(CPU_BUFFERS)):
         if i < INITIAL_CPU_BUFFER_COUNT:
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
@@ -1230,18 +1215,15 @@ def reset_unsloth_gradient_checkpointing_buffers():
             CPU_BUFFERS[i] = None
     pass
 
-    # Trim the list back to initial count if it grew
     if len(CPU_BUFFERS) > INITIAL_CPU_BUFFER_COUNT:
         del CPU_BUFFERS[INITIAL_CPU_BUFFER_COUNT:]
     pass
 
-    # Reset GPU buffers to initial size
     for i in range(len(GPU_BUFFERS)):
         if GPU_BUFFERS[i] is not None and hasattr(GPU_BUFFERS[i], "resize_"):
             GPU_BUFFERS[i].resize_(INITIAL_GPU_BUFFER_SIZE)
     pass
 
-    # Reset state for a fresh training run
     CPU_INDEX = 0
     BACKWARD_PASS = True
     LAST_GC_INDEX = 0
@@ -1252,7 +1234,6 @@ def reset_unsloth_gradient_checkpointing_buffers():
         for i in range(len(NEXT_BUFFER_SLOT)):
             NEXT_BUFFER_SLOT[i] = 0
 
-    # Reset double buffering if buffer B still exists, or try to re-allocate
     if _double_buffer_disabled():
         if GPU_BUFFERS_B is not None:
             for i in range(len(GPU_BUFFERS_B)):

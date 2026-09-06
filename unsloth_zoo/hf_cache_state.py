@@ -185,10 +185,6 @@ def snapshot_dir_has_broken_symlinks(snapshot_dir: Path) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Weight-file recognition
-# ---------------------------------------------------------------------------
-
 _WEIGHT_FILE_SUFFIXES = (
     ".safetensors",
     ".bin",
@@ -325,10 +321,6 @@ def _weight_shard_index_complete(index_path: Path) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
-# Pattern helpers (normalization + glob detection + HF filtering)
-# ---------------------------------------------------------------------------
-
 _GLOB_CHARS = ("*", "?", "[")
 
 
@@ -425,10 +417,6 @@ def snapshot_has_requested_broken_symlinks(
         return False
     return bool(_filter_paths(broken, allow_patterns, ignore_patterns))
 
-
-# ---------------------------------------------------------------------------
-# The conservative fast-path completeness gate
-# ---------------------------------------------------------------------------
 
 # Canonical root weight filenames a default load reads (the single file or its shard index proves warm).
 _CANONICAL_SINGLE_WEIGHTS = ("model.safetensors", "pytorch_model.bin")
@@ -1189,10 +1177,6 @@ def requested_named_files_present(
             return False
     return True
 
-
-# ---------------------------------------------------------------------------
-# Active-cache enumeration primitives (download-manager / watchdog support)
-# ---------------------------------------------------------------------------
 
 def _iter_snapshot_dirs(repo_dir: Path) -> Iterator[Path]:
     snapshots_dir = repo_dir / "snapshots"

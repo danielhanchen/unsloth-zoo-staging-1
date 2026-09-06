@@ -88,19 +88,16 @@ def compare_attributes(original_model, new_model):
         buffer_names = {name for name,_ in original_module.named_buffers(recurse=False)}
 
 
-        # Missing: in original but not in new
         missing_in_new = orig_attrs - new_attrs
         missing_in_new = missing_in_new - {'hf_device_map', 'source_cls'}
         if missing_in_new:
             for attr in sorted(missing_in_new):
                 missing_attrs.append(f"{name}.{attr}")
 
-        # Extra: in new but not in original
         extra_in_new = new_attrs - orig_attrs
         if extra_in_new:
             print(f'Found some extra attributes like: {list(extra_in_new)[:5]}...')
 
-        # Compare common attributes and buffer names
         common_attrs = orig_attrs & new_attrs
         common_buffers = orig_attrs | buffer_names
         for attr in sorted(common_attrs):
@@ -259,7 +256,6 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         if hasattr(config, "model_name"):
             causal_config.model_name = config.model_name
     _set_runtime_dtype(causal_config)
-    # Suppress warning on uninited weights
     old_warn = os.environ.get("UNSLOTH_WARN_UNINITIALIZED", "1")
     os.environ["UNSLOTH_WARN_UNINITIALIZED"] = "0"
     model_name = getattr(causal_config, 'model_name', getattr(config, 'model_name', None))
@@ -308,7 +304,6 @@ def create_empty_causal_lm(config, dtype = torch.float16):
         "linear_conv_kernel_dim": 1,
     })
 
-    # Set attention module head_dim
     head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
 
@@ -533,7 +528,6 @@ def create_empty_vision_model(config, dtype = torch.float16):
             traceback.print_exc()
             original_meta_model = None
     finally:
-        # Restore original SiglipVisionModel weight init
         if patched_here and hasattr(SiglipVisionModel, "_original_initialize_weights"):
             SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
             del SiglipVisionModel._original_initialize_weights
@@ -541,7 +535,6 @@ def create_empty_vision_model(config, dtype = torch.float16):
 
     new_config = deepcopy(config)
 
-    # Common text attributes
     _set_config_attrs(new_config.text_config, {
         "num_attention_heads": 1,
         "num_key_value_heads": 1,
@@ -560,7 +553,6 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "linear_conv_kernel_dim": 1,
     })
 
-    # Common vision attributes
     _set_config_attrs(new_config.vision_config, {
         "hidden_size": 1,
         "intermediate_size": 1,
@@ -1454,7 +1446,6 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
     layer_counts = get_model_layer_counts(vllm_internals.config)
     num_layers_to_iterate = max(layer_counts.values()) if isinstance(layer_counts, dict) else layer_counts
 
-    # Process layered components
     for kk in range(num_layers_to_iterate):
         for layer_template in all_layered_templates:
             layer_path = layer_template.format(kk=kk)
@@ -1491,7 +1482,6 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                     else:
                         print(f"Unsloth: Skipping layer '{layer_path}' of unexpected type: {type(layer_module)}")
 
-    # Extract non-layered vision components
     non_layered_components = layer_config.get('non_layered_components', [])
     for component_path in non_layered_components:
         component = _get_nested_attr(vllm_internals, component_path)
@@ -1504,7 +1494,6 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                 quant_state_dict[component_path] = component.data
             elif isinstance(component, torch.nn.Module):
                 for param_name, param in component.named_parameters():
-                    # Skip params extracted separately
                     if param_name.replace('.weight', '') in non_layered_components: continue
                     full_param_path = f"{component_path}.{param_name}"
                     if hasattr(param, 'weight'):

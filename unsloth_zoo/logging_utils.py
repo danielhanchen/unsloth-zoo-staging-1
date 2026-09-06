@@ -85,18 +85,14 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
     set_Trainer_metrics = frozenset(Trainer_metrics)
 
     def _NotebookProgressCallback_on_log(self, args, state, control, logs = None, **kwargs):
-        # Only for when there is no evaluation
         if args.eval_strategy == IntervalStrategy.NO and "loss" in logs:
             values = {}
 
-            # 1) Pre-extracted metrics, only if present in logs
             for metric in Trainer_metrics:
                 if metric in logs:
                     values[metric.replace("/", " / ")] = logs[metric]
             pass
 
-            # 2) Dynamic per-reward-function metrics (rewards/*): user-defined
-            #    names, so sort for stable column ordering across steps.
             dynamic_reward_keys = sorted(
                 k for k in logs
                 if k.startswith("rewards/") and k not in set_Trainer_metrics
@@ -107,7 +103,6 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
                     values[display_key] = logs[key]
             pass
 
-            # 3) Prepend Training Loss + Step as first columns
             values = {"Training Loss": logs["loss"], **values}
             values[self.first_column] = state.global_step
             self.training_tracker.write_line(values)
@@ -144,17 +139,14 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
             if len(self.inner_table) > 1:
                 last_values = self.inner_table[-1]
                 if last_values[0] != values[first_column]:
-                    # write new line
                     self.inner_table.append([values[c] if c in values else "" for c in columns])
                 else:
-                    # update last line, preserving existing values for missing keys
                     new_values = values
                     for c in columns:
                         if c not in new_values:
                             new_values[c] = last_values[columns.index(c)]
                     self.inner_table[-1] = [new_values[c] for c in columns]
             else:
-                # First data row (after header)
                 self.inner_table.append([values[c] if c in values else "" for c in columns])
             pass
         pass
@@ -168,7 +160,6 @@ def _PatchRLStatistics(metrics, algorithm):
         if len(metrics) == 0: return
         from transformers.trainer import is_in_notebook
         if is_in_notebook():
-            # Patch DPO notebook printing
             NotebookTrainingTracker.write_line = NotebookTrainingTracker_write_line(metrics)
             from transformers.trainer import DEFAULT_PROGRESS_CALLBACK
             DEFAULT_PROGRESS_CALLBACK.on_train_begin = NotebookProgressCallback_on_train_begin(metrics)
@@ -180,7 +171,6 @@ pass
 
 @functools.cache
 def get_trl_metrics():
-    # Gets metrics so we can output them in notebooks
 
     import trl.trainer
     trainers = dir(trl.trainer)
@@ -240,7 +230,6 @@ def get_trl_metrics():
         left_prefix = 'prefix = "eval_" if train_eval == "eval" else ""' in file
         if left_prefix: metrics += metrics_f
 
-        # Move all eval_ things to the end and reward to the front
         beginning = []
         middle = []
         end = []

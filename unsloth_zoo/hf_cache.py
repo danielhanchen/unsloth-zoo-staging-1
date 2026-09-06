@@ -40,7 +40,6 @@ def _expand_env_path(value: str) -> Path:
 
 
 def _is_writable(path: Path) -> bool:
-    # Create the dir and a throwaway file; any failure means not writable.
     # Symlinks are allowed here: users legitimately symlink caches to large
     # volumes. Fallback paths are hardened separately in _is_safe_private_dir.
     try:
@@ -94,7 +93,6 @@ def _safe_user() -> str:
 
 
 def _fallback_bases() -> list[Path]:
-    # Ordered writable candidates used when the default cache is read-only.
     user = _safe_user()
     bases = [Path(tempfile.gettempdir()) / f"huggingface_{user}"]
     try:

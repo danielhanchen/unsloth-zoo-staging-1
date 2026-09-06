@@ -245,7 +245,6 @@ def get_peft_regex(
                 r").*?"   + match_linear_modules
     pass
 
-    # Final check to confirm if matches exist
     check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
     if not check and target_modules is not None:
         raise RuntimeError(
@@ -314,7 +313,6 @@ def requires_grad_for_gradient_checkpointing(model):
         pass
     pass
 
-    # Remove all previous forward hooks for gradient checkpointing
     for name, module in model.named_modules():
         if len(module._forward_hooks) != 0:
             register_other_hooks(
@@ -326,7 +324,6 @@ def requires_grad_for_gradient_checkpointing(model):
         pass
     pass
 
-    # Add post forward hook
     def requires_grad_post_hook(module, input, output):
         type_output = type(output)
         if type_output is torch.Tensor:
@@ -407,7 +404,6 @@ def requires_grad_for_gradient_checkpointing(model):
             fallback_name = None
             fallback_module = None
 
-            # Try getting previous parent module
             for j in range(len(name_components)-1, 0, -1):
                 name_curr = name_components[j]
                 name_pre  = "model." + ".".join(name_components[:j])
@@ -475,7 +471,6 @@ def requires_grad_for_gradient_checkpointing(model):
         logger.info(f"Unsloth: Making `{module_name}` require gradients")
 
         still_need_patching = True
-        # Check if input_embeddings exists
         if hasattr(module, "get_input_embeddings"):
             # Use forward hook after Embedding() is called
             try:
@@ -498,7 +493,6 @@ def requires_grad_for_gradient_checkpointing(model):
         pass
 
         if still_need_patching:
-            # Use forward pre hook before module is called
             register_other_hooks(
                 "requires_grad_pre_hook",
                 "requires_grad_pre_hook",

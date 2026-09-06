@@ -161,9 +161,6 @@ class _SearchExhausted(Exception):
     """Internal: the bounded exact-packing search hit its node budget."""
 
 
-# --------------------------------------------------------------------------- #
-# logit transform detection
-# --------------------------------------------------------------------------- #
 def _config_attr(holder, name, default = None):
     """``getattr`` that a hostile config cannot break out of.
 
@@ -326,9 +323,6 @@ def detect_logit_transforms(model_or_config) -> dict:
         return zero
 
 
-# --------------------------------------------------------------------------- #
-# headroom formula
-# --------------------------------------------------------------------------- #
 def logit_headroom_bytes(
     vocab_size: int,
     rows_per_chunk: int,
@@ -384,9 +378,6 @@ def logit_headroom_bytes(
     return int(per_chunk + retained + safety_bytes)
 
 
-# --------------------------------------------------------------------------- #
-# plan object
-# --------------------------------------------------------------------------- #
 @dataclass
 class DeviceMapPlan:
     """Result of :func:`plan_device_map`."""
@@ -440,9 +431,6 @@ class DeviceMapPlan:
         return "\n".join(lines)
 
 
-# --------------------------------------------------------------------------- #
-# introspection helpers (all generic)
-# --------------------------------------------------------------------------- #
 def _parse_size(value: Any) -> int:
     """Accept 12345, "14GiB", "14GB", "500MiB"."""
     if isinstance(value, (int,)) and not isinstance(value, bool):
@@ -891,9 +879,6 @@ def _usable_devices(max_memory: Mapping[Any, Any] | None) -> list[int]:
     return list(range(torch.cuda.device_count()))
 
 
-# --------------------------------------------------------------------------- #
-# the planner
-# --------------------------------------------------------------------------- #
 def plan_device_map(
     model: nn.Module,
     *,
@@ -1618,9 +1603,6 @@ def plan_device_map(
     )
 
 
-# --------------------------------------------------------------------------- #
-# pre-load convenience
-# --------------------------------------------------------------------------- #
 def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     """The quantisation the CALLER asked for, popped out of the loader kwargs.
 

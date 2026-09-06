@@ -710,7 +710,6 @@ def _child_open_incomplete_blobs(pid: int) -> Optional[set]:
         except Exception:
             return None
         return {os.path.basename(f.path) for f in files if f.path.endswith(INCOMPLETE_SUFFIX)}
-    # Linux fallback: read open fds from /proc.
     fd_dir = f"/proc/{pid}/fd"
     try:
         entries = os.listdir(fd_dir)

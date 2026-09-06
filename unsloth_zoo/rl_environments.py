@@ -268,7 +268,6 @@ def check_signal_escape_patterns(code: str):
             func = node.func
             func_name = None
 
-            # Get the function name for pattern matching
             if isinstance(func, ast.Attribute):
                 # signal.signal(...), signal.setitimer(...), etc.
                 if isinstance(func.value, ast.Name):
@@ -282,10 +281,8 @@ def check_signal_escape_patterns(code: str):
                 if func.id in ("signal", "setitimer", "alarm", "pthread_sigmask"):
                     func_name = func.id
 
-            # Check for signal tampering patterns
             if func_name:
                 if func_name in ("signal.signal", "signal"):
-                    # Check if setting SIGALRM handler
                     if len(node.args) >= 1:
                         arg0 = node.args[0]
                         if _ast_name_matches(arg0, ("SIGALRM", "signal.SIGALRM")):
@@ -296,7 +293,6 @@ def check_signal_escape_patterns(code: str):
                             })
 
                 elif func_name in ("signal.setitimer", "setitimer"):
-                    # Check if disabling ITIMER_REAL
                     if len(node.args) >= 1:
                         arg0 = node.args[0]
                         if _ast_name_matches(arg0, ("ITIMER_REAL", "signal.ITIMER_REAL")):
@@ -329,9 +325,7 @@ def check_signal_escape_patterns(code: str):
                 self.generic_visit(node)
                 return
 
-            # Check for bare except or catching TimeoutError/BaseException inside a loop
             if node.type is None:
-                # Bare except:
                 exception_catching.append({
                     "type": "bare_except_in_loop",
                     "line": node.lineno,
@@ -375,7 +369,6 @@ def check_signal_escape_patterns(code: str):
     visitor = SignalEscapeVisitor()
     visitor.visit(tree)
 
-    # Add warning if signal is imported but no specific tampering found
     if visitor.imports_signal and not signal_tampering:
         warnings.append("Code imports 'signal' module - review manually for safety")
 
@@ -1037,9 +1030,6 @@ class Benchmarker:
         }
 pass
 
-####################
-##### Open Env #####
-####################
 import socket
 import requests
 import random
@@ -1076,13 +1066,10 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
     src_path = os.path.join(working_directory, "src")
 
     if os.path.exists(root_client):
-        # New structure: envs at root + openenv in src
         return f"{working_directory}{os.pathsep}{src_path}"
     elif os.path.exists(src_client):
-        # Old structure: everything in src
         return src_path
     else:
-        # Fallback: try both paths
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
@@ -1095,14 +1082,12 @@ def launch_openenv(
     openenv_class = None,
 ):
     """ Finds a new port or checks if the old open port actually works """
-    # Check if OpenEnv is working first
     assert type(environment) is dict
     assert type(port) is int and port >= 0 and port <= (65535-1)
     assert type(working_directory) is str
     assert openenv_class is not None
     assert type(server) is str
 
-    # Auto-fix PYTHONPATH for OpenEnv compatibility
     correct_pythonpath = _get_openenv_pythonpath(working_directory)
     if environment.get("PYTHONPATH") != correct_pythonpath:
         environment = dict(environment)  # Don't mutate original
@@ -1119,14 +1104,12 @@ def launch_openenv(
                     except: pass
                     process = None
                 else:
-                    # It should work, so simply return the old one!
                     return process
             except:
                 process = None
         return process
     openenv_process = check_openenv_works(openenv_process)
 
-    # Otherwise, find the next port which can be used
     trials = 0
     while openenv_process is None:
         # Port ID must be less than uint16_MAX
@@ -1141,7 +1124,6 @@ def launch_openenv(
             text = True,
             cwd = working_directory,
         )
-        # Wait until port is open
         wait_trials = 0
         while not is_port_open("localhost", port):
             time.sleep(0.01)

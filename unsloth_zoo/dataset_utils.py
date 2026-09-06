@@ -69,13 +69,11 @@ def _longest_common_sublist(lists):
         """Return (exists, sublist) for a common sublist of `length`."""
         common = set()
         first = lists[0]
-        # All sublists of `length` from the first list
         for i in range(len(first) - length + 1):
             sub = tuple(first[i:i + length])
             common.add(sub)
         pass
 
-        # Keep only sublists also present in every remaining list
         for lst in lists[1:]:
             current = set()
             for i in range(len(lst) - length + 1):
@@ -89,7 +87,6 @@ def _longest_common_sublist(lists):
         return True, list(common.pop())
     pass
 
-    # Binary search on length
     left, right = 1, min_len
     result = []
 
@@ -125,7 +122,6 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
     elif component.startswith("\n"): left_text = "\n"
     stripped = component.strip()
     
-    # Add current pieces and also newlines
     all_input_ids = []
     if not force_match:
         for left in range(3):
@@ -224,7 +220,6 @@ def get_chat_template_parts(tokenizer):
     specials = sorted({str(s) for s in (set(getattr(tok, "all_special_tokens", []) or []) | added) if s}, key = len, reverse = True)
 
     def strip_lead(s, *prefixes):
-        # Remove any of the given leading strings, repeatedly
         changed = True
         while changed:
             changed = False
@@ -233,7 +228,6 @@ def get_chat_template_parts(tokenizer):
         return s
 
     def strip_shared(a, b):
-        # Drop leading special-tokens/whitespace common to both until roles differ
         while True:
             wa, wb = re.match(r"\s+", a), re.match(r"\s+", b)
             if wa and wb and wa.group() == wb.group():
@@ -247,7 +241,6 @@ def get_chat_template_parts(tokenizer):
         return a, b
 
     def gap_mode(from_ends, to_starts):
-        # Most common text between adjacent content blocks
         out = []
         for e in from_ends:
             nxt = [s for s in to_starts if s >= e]
@@ -712,7 +705,6 @@ def train_on_responses_only(
     # Keep the original object (may be a VLM processor) so auto-detect can read a
     # chat template that lives only on the processor; the matcher uses the inner one.
     processor = tokenizer
-    # Get non vision tokenizer
     if hasattr(tokenizer, "image_processor") or hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
     if  not hasattr(tokenizer, "_unsloth_input_part") or \
@@ -755,7 +747,6 @@ def train_on_responses_only(
         )
     pass
 
-    # Store some temporary stuff
     A_first = A_must[0]
     len_A_must = len(A_must)
     A_left_reversed = A_left[::-1]
@@ -805,14 +796,11 @@ def train_on_responses_only(
             n_minus_1 = n - 1
             j = 0
 
-            # Collect all (assistant_k, user_j) spans for this sample
             spans = []
             while j < n:
-                # Find <assistant>
                 if (input_ids[j] == A_first) and \
                     (input_ids[j : (k := j + len_A_must)] == A_must):
 
-                    # Extend over optional tokens, backward then forward
                     for optional_left in A_left_reversed:
                         if j < 1: break
                         if optional_left == input_ids[j-1]: j -= 1
@@ -827,13 +815,11 @@ def train_on_responses_only(
                     assistant_k = k
 
                     j = assistant_k
-                    # Find the next <user> (or the final item if assistant is last)
                     while j < n:
                         if (j == n_minus_1) or \
                             ((input_ids[j] == Q_first) and \
                              (input_ids[j : (k := j + len_Q_must)] == Q_must)):
 
-                            # Extend over optional tokens, backward then forward
                             for optional_left in Q_left_reversed:
                                 if j < 1: break
                                 if optional_left == input_ids[j-1]: j -= 1
@@ -845,7 +831,6 @@ def train_on_responses_only(
                                 else: break
                             pass
                             user_j = j
-                            # Account for last item
                             if user_j != n_minus_1:
                                 # user_k = k
                                 # j = user_k
@@ -2307,7 +2292,6 @@ def standardize_data_formats(
                 uniques[key].append(value)
     pass
 
-    # Must be only 2 entries
     assert(len(uniques.keys()) == 2)
 
     keys = list(uniques.keys())
@@ -2315,7 +2299,6 @@ def standardize_data_formats(
     length_second = len(set(uniques[keys[1]]))
 
     if length_first < length_second:
-        # Role is assigned to the first element
         role_key    = keys[0]
         content_key = keys[1]
     else:
@@ -2323,7 +2306,6 @@ def standardize_data_formats(
         content_key = keys[0]
     pass
 
-    # Check roles are in aliases
     all_aliases = set(aliases_for_system + aliases_for_user + aliases_for_assistant)
     roles = set(uniques[role_key])
     leftover_aliases = (all_aliases | roles) - all_aliases
@@ -2333,7 +2315,6 @@ def standardize_data_formats(
         )
     pass
 
-    # Mapping for aliases
     aliases_mapping = {}
     for x in aliases_for_system:    aliases_mapping[x] = "system"
     for x in aliases_for_user:      aliases_mapping[x] = "user"

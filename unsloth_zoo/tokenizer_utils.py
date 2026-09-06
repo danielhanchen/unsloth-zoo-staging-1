@@ -59,7 +59,6 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     embedding_matrix = model.get_input_embeddings ().weight.clone()
     lm_head_matrix   = model.get_output_embeddings().weight.clone()
 
-    # Get untrained tokens
     indicator_untrained = torch.amax(embedding_matrix, axis = 1) <= eps
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
@@ -71,15 +70,12 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     #     )
     # pass
 
-    # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
     sum_lm_head   = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
 
-    # Remove bad tokens
     sum_embedding -= torch.sum(embedding_matrix[where_untrained], dtype = torch.float32, axis = 0)
     sum_lm_head   -= torch.sum(lm_head_matrix  [where_untrained], dtype = torch.float32, axis = 0)
 
-    # Find correct average by dividing by sum of trained tokens
     mean_embedding = (sum_embedding / n_trained)
     mean_lm_head   = (sum_lm_head   / n_trained)
 
@@ -123,18 +119,15 @@ def add_new_tokens(
     mean_embedding = mean_embedding.to(torch.float32)
     mean_lm_head   = mean_lm_head  .to(torch.float32)
 
-    # Get old lengths
     old_input_embedding  = model.get_input_embeddings ().weight
     old_output_embedding = model.get_output_embeddings().weight
     old_input_length  = old_input_embedding .shape[0]
     old_output_length = old_output_embedding.shape[0]
     old_config_size   = model.config.vocab_size
 
-    # Check for tied weights as well
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
         or (model.config.tie_word_embeddings)
 
-    # Add tokens!
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
     new_vocab_length = len(tokenizer)
@@ -182,11 +175,9 @@ def add_new_tokens(
             mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
             mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
 
-            # Interpolate
             mean_embedding_token = mean_embedding*(1-interpolation) + mean_embedding_token*interpolation
             mean_lm_head_token   = mean_lm_head  *(1-interpolation) + mean_lm_head_token  *interpolation
 
-            # Set the new vector
             with torch.no_grad():
                 embedding_matrix[old_length+j] = mean_embedding_token
                 lm_head_matrix  [old_length+j] = mean_lm_head_token
@@ -201,7 +192,6 @@ def add_new_tokens(
             lm_head_matrix  [old_length:new_vocab_length] = mean_lm_head
     pass
 
-    # We set a flag to say we need to train embeddings
     internal_model = model
     while hasattr(internal_model, "model"):
         internal_model._need_to_train_embeddings = True
@@ -227,7 +217,6 @@ def add_new_tokens(
     # Otherwise error will occur on saving models ie use save_model
     if is_tied: model.tie_weights()
 
-    # Clear deleted GPU items
     for _ in range(3):
         gc.collect()
         torch.cuda.empty_cache()
@@ -263,7 +252,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     embedding_matrix = embedding_matrix[:min_size]
     lm_head_matrix   = lm_head_matrix  [:min_size]
     
-    # Get untrained tokens
     indicator_untrained1 = torch.amax(embedding_matrix, axis = 1) <= eps
     # Check lm_head as well
 
@@ -287,10 +275,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     indicator_untrained2 = indicator_untrained2 | torch.zeros_like(indicator_untrained2)
     indicator_untrained2[final_bad_lm_head] = True
 
-    # Combine both checks
     indicator_untrained = indicator_untrained1.to("cpu") & indicator_untrained2.to("cpu")
 
-    # Remove pad token and other important token possibilities
     special_tokens = (
         "bos_token",
         "eos_token",
@@ -312,18 +298,15 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
 
-    # Get set and actual tokens
     where_untrained = where_untrained.tolist()
     if len(where_untrained) == 0: return
 
-    # Remove untrained indices where it's longer
     
     where_untrained_set = frozenset(where_untrained)
     actual_bad_tokens = tokenizer.convert_ids_to_tokens(where_untrained)
     # Remove None items in actual_bad_tokens
     actual_bad_tokens = [x for x in actual_bad_tokens if x is not None]
 
-    # Check if tokenizer and training datasets have bad tokens
     if_bad_first  = False
     if_bad_second = False
     # Check tokenizer's chat template for any untrained tokens
@@ -336,7 +319,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         # an indexable dataset
         return
 
-    # Check the first 250, last 250 input_ids
     size_dataset = len(train_dataset)
     size = min(size_dataset, 250)
     for j in range(size):
@@ -351,7 +333,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         pass
     pass
 
-    # Check last 250
     if not if_bad_second:
         left = max(size_dataset-250, 0)
         for j in range(left, size_dataset):
@@ -367,10 +348,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         pass
     pass
 
-    # Check if bad tokens exists!
     if not if_bad_first and not if_bad_second: return
 
-    # Check if lm_head / embed_token are trainable!
     bad_not_trainable = False
     if not embedding_matrix.requires_grad: bad_not_trainable = True
     if not lm_head_matrix  .requires_grad: bad_not_trainable = True
@@ -380,7 +359,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         final_bad_items = []
         which_locations = []
 
-        # Re-check the first 250, last 250 input_ids
         size_dataset = len(train_dataset)
         size = min(size_dataset, 250)
         for j in range(size):
@@ -394,7 +372,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             pass
         pass
 
-        # Re-check last 250
         left = max(size_dataset-250, 0)
         for j in range(left, size_dataset):
             input_ids = train_dataset[j]
@@ -423,7 +400,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
                 pass
             pass
 
-            # Re-check last 2000
             left = max(size_dataset-2000, 0)
             for j in range(left, size_dataset):
                 input_ids = train_dataset[j]
@@ -451,7 +427,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         )
     pass
 
-    # Count all the possible bad tokens
     final_counts = np.zeros(max(len(tokenizer), embedding_matrix.shape[0]), dtype = np.int64)
     def mapping(examples):
         input_ids = examples["input_ids"]
@@ -460,19 +435,15 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     pass
     train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
 
-    # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
     sum_lm_head   = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
 
-    # Remove bad tokens
     sum_embedding -= torch.sum(embedding_matrix[where_untrained], dtype = torch.float32, axis = 0)
     sum_lm_head   -= torch.sum(lm_head_matrix  [where_untrained], dtype = torch.float32, axis = 0)
 
-    # Find correct average by dividing by sum of trained tokens
     mean_embedding = (sum_embedding / n_trained)
     mean_lm_head   = (sum_lm_head   / n_trained)
 
-    # Scale each to be equal to 1/max_frequency. Also set some to 0 if none seen
     scaling = final_counts[where_untrained] / max(final_counts.max(), 1)
     scaling = torch.tensor(scaling, device = mean_embedding.device).unsqueeze(1)
     mean_embedding = mean_embedding.repeat((n_untrained, 1,)) * scaling
@@ -481,7 +452,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     mean_embedding[where_null] = 0
     mean_lm_head  [where_null] = 0
 
-    # Set them to the mean
     print(
         "Unsloth: Setting embed_tokens & lm_head untrained tokens to "\
         "mean(trained) to counteract NaNs during training."
@@ -489,7 +459,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     embedding_matrix[where_untrained] = mean_embedding.to(embedding_matrix.dtype)
     lm_head_matrix  [where_untrained] = mean_lm_head  .to(lm_head_matrix  .dtype)
 
-    # Clean up
     for _ in range(3):
         gc.collect()
         torch.cuda.empty_cache()

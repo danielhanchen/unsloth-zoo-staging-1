@@ -92,7 +92,6 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         return None
     pass
 
-    # Generic cross entropy loss
     def unsloth_fixed_cross_entropy(source, target, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs):
         if ignore_index == -100:
             loss = _fast_cross_entropy_loss(
@@ -116,7 +115,6 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         return loss
     pass
     
-    # Causal LM loss
     def UnslothForCausalLMLoss(
         logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
     ):
@@ -141,7 +139,6 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         )
     pass
 
-    # Now patch the losses!
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
     # Patch every key still aliased to the stock ForCausalLMLoss. PreTrainedModel
@@ -287,7 +284,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     batch_samples = []
     num_items_in_batch = None
 
-    # Check if model allows **kwargs
     m = self.model
     if hasattr(m, "get_base_model"):
         # Removes PeftModelForCausalLM and gets internal model
@@ -331,7 +327,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         has_kwargs, is_vlm = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
     pass
 
-    # Iterate to find all batches
     for _ in range(num_batches):
         try:
             batch_samples += [next(epoch_iterator)]
@@ -339,7 +334,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
-    # Get num_items_in_batch
     if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
         try:
             token_counts = []

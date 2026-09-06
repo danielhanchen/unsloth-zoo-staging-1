@@ -59,7 +59,6 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
     row = train_dataset[0]
     if type(row) is dict and "labels" in row:
 
-        # Check the first 100 rows
         seen_bad  = 0
         seen_good = 0
         for i, row in enumerate(train_dataset):
@@ -70,7 +69,6 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
             if i >= 100: break
         pass
 
-        # Check ratio
         if seen_bad == 0 and seen_good == 0: return
 
         elif seen_bad / (seen_bad + seen_good) == 1:
@@ -600,7 +598,6 @@ def unsloth_train(trainer):
         )
     pass
 
-    # Separate weight decay for parameters
     optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(training_args)
     decay_parameters = frozenset(Trainer.get_decay_parameter_names(None, model))
     yes_decay, no_decay = [], []
@@ -623,7 +620,6 @@ def unsloth_train(trainer):
     total_train_batch_size, max_steps, num_train_epochs = \
         get_max_steps(training_args, n_training_samples, trainer.train_dataset)
 
-    # Get LR scheduler
     lr_scheduler = transformers_get_scheduler(
         name = training_args.lr_scheduler_type,
         optimizer = optimizer,
@@ -632,7 +628,6 @@ def unsloth_train(trainer):
         **getattr(training_args, "lr_scheduler_kwargs", {}),
     )
 
-    # Gradient accumulation and grad norm clipping
     max_grad_norm   = training_args.max_grad_norm
     clip_grad_norm_ = torch.nn.utils.clip_grad_norm_
     bsz = training_args.per_device_train_batch_size
@@ -642,7 +637,6 @@ def unsloth_train(trainer):
     #     torch.FloatTensor([inverse_gradient_accumulation_steps])\
     #     .to(device = "cuda:0", non_blocking = True)[0]
 
-    # Mixed precision scaling
     torch_version = torch.__version__
     config_dtype = dtype_from_config(model.config)
     if config_dtype == torch.float16:
@@ -686,15 +680,12 @@ def unsloth_train(trainer):
         f' "-____-"     Number of trainable parameters = {n_parameters_to_train:,}'
     print(debug_info)
 
-    # Get per epoch counter
     max_iters_per_epoch = math.ceil(n_training_samples / total_train_batch_size)
     leftover_samples = n_training_samples % total_train_batch_size
-    # But also consider leftover steps
     leftover_ga = math.ceil(leftover_samples / bsz)
     if leftover_samples == 0: leftover_ga = ga
 
     logging_steps = training_args.logging_steps
-    # Go through each epoch
     start_time = time.time()
     with ProgressBar(total = max_steps, dynamic_ncols = True) as progress_bar:
         for epoch in range(num_train_epochs):
@@ -716,12 +707,10 @@ def unsloth_train(trainer):
                 n_batches = leftover_ga if j == (max_iters_per_epoch-1) else ga
                 batches = [next(train_dataloader_iterator) for j in range(n_batches)]
 
-                # Count non zeros before loss calc
                 n_items = torch.stack([
                     torch.count_nonzero(x["labels"][..., 1:] != -100) for x in batches
                 ]).sum()
 
-                # Gradient accumulation
                 for batch in batches:
                     input_ids = batch["input_ids"].pin_memory().to(device = "cuda:0", non_blocking = True)
                     labels    = batch["labels"]   .pin_memory().to(device = "cuda:0", non_blocking = True)
@@ -762,7 +751,6 @@ def unsloth_train(trainer):
     print("Unsloth: Finished training!")
     end_time = time.time()
 
-    # Return stats
     trainer_stats = Trainer_Stats(metrics = {"train_runtime" : end_time - start_time})
     return trainer_stats
 pass
