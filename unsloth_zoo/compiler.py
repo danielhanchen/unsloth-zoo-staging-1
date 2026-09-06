@@ -82,7 +82,6 @@ UNSLOTH_COMPILE_USE_TEMP = False
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 
-# device capability
 major = None
 minor = None
 # Bound before the branches: DEVICE_TYPE == "cpu" takes none of them, and
@@ -106,7 +105,6 @@ pass
 
 OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
 
-# Check if Unsloth Studio is allowed
 import importlib.util
 
 if importlib.util.find_spec("unsloth_studio") is None:
@@ -116,7 +114,6 @@ else:
 pass
 
 
-# Ignore logging messages
 class HideLoggingMessage(logging.Filter):
     def __init__(self, text):
         self.text = text
@@ -282,7 +279,6 @@ _patch_functions = [
 ]
 
 
-# Empty causal mask
 def no_update_causal_mask(*args, **kwargs):
     return None
 
@@ -593,7 +589,6 @@ def _get_compile_folder(use_tempfile=False):
     else:
         location = UNSLOTH_COMPILE_LOCATION
         try:
-            # Try creating the directory
             os.makedirs(location, exist_ok=True)
             return location, UNSLOTH_COMPILE_USE_TEMP
         except Exception as e:
@@ -601,7 +596,6 @@ def _get_compile_folder(use_tempfile=False):
                 f"Unsloth: Failed to create directory `{UNSLOTH_COMPILE_LOCATION}` because {str(e)}"
             )
 
-            # Instead use a temporary location!
             location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile=True)
     return location, UNSLOTH_COMPILE_USE_TEMP
 
@@ -619,7 +613,6 @@ def get_compile_folder(use_tempfile=False):
 pass
 
 
-# Mask creation functions
 @functools.lru_cache(1)
 def get_mask_functions():
     try:
@@ -808,7 +801,6 @@ def fix_rotary_embedding_dtype(source):
             checker, _dtype, _bnb_compute_dtype, _custom_datatype, execute_code = (
                 custom_datatype.split(";", 4)
             )
-            # Allow custom dtypes on all runs
             allow_all_runs = checker == "all"
             # Allow only on float16 datatypes
             allow_float16_runs = (
@@ -901,7 +893,6 @@ def higher_precision_layernorms(modeling_file):
     else:
         dtype = torch.float16
 
-    # Set environment variable
     higher_precision = os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1"
     if dtype == torch.float32:
         higher_precision = True
@@ -1254,7 +1245,6 @@ def create_new_function(
         new_source = new_source + "\n" + disble_use_cache_logging + "\n"
     new_source = prepend + new_source + append
 
-    # Check versioning
     try:
         unsloth_zoo_version = importlib_version("unsloth_zoo")
     except:
@@ -1284,13 +1274,11 @@ def create_new_function(
     else:
         write_new_source = versioning + new_source
 
-    # Write function
     global UNSLOTH_COMPILE_USE_TEMP
     file_source = None
     compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(use_tempfile=False)
     function_location = os.path.join(compile_folder, f"{name}.py")
 
-    # Check if file was already created!
     if not overwrite and os.path.isfile(function_location):
         # Check if exactly equivalent
         with open(function_location, "r", encoding="utf-8") as f:
@@ -1363,13 +1351,11 @@ def create_new_function(
         else:
             overwrite = False
 
-    # Check location
     def write_file(function_location, write_new_source):
         lock = get_lock(function_location)
         new_write_bytes = write_new_source.encode("utf-8")
         try:
             with lock:
-                # existence check
                 try:
                     st = os.stat(function_location)
                 except Exception as e:
@@ -1406,7 +1392,6 @@ def create_new_function(
             if UNSLOTH_COMPILE_USE_TEMP:
                 raise RuntimeError(error)
             else:
-                # Failed so instead use a temporary directory
                 compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
                     use_tempfile=True
                 )
@@ -1423,16 +1408,13 @@ def create_new_function(
     def import_module(compile_folder, name):
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
-        # Add directory to sys.path temporarily if it's not already there
         if compile_folder not in sys.path:
             old_path = list(sys.path)
-            # Fail if name already exists!
             if name in old_path:
                 raise OSError(f"Unsloth: File {name} already exists")
             sys.path.insert(0, compile_folder)
         try:
             with lock:
-                # Try standard import
                 new_module = importlib.import_module(name)
                 return new_module, old_path
         except Exception as e:
@@ -1448,7 +1430,6 @@ def create_new_function(
         new_module, old_path = import_module(compile_folder, name)
     except Exception as e:
         new_module = None
-        # Try using temp directory instead!
         if not UNSLOTH_COMPILE_USE_TEMP:
             compile_folder, UNSLOTH_COMPILE_USE_TEMP = get_compile_folder(
                 use_tempfile=True
@@ -1468,7 +1449,6 @@ def create_new_function(
                         f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!"
                     )
         pass
-        # Fallback to direct module loading
         if new_module is None:
             try:
                 module_name = f"unsloth_cache_{name}"
@@ -1485,7 +1465,6 @@ def create_new_function(
                 raise RuntimeError(f"Direct module loading failed for {name}: {e}")
         pass
     finally:
-        # Restore original sys.path if we modified it
         if old_path is not None:
             sys.path = old_path
 
@@ -1742,7 +1721,6 @@ def create_standalone_class(
                             skip_base_name = decorator_base
                         continue  # Strip this decorator line
 
-                    # Unknown decorator -> keep it but warn
                     logger.warning(
                         f"Unsloth: Warning: Unknown decorator {stripped} found for {module}."
                     )
@@ -1758,13 +1736,11 @@ def create_standalone_class(
     if 'gptossexperts' != module.lower():
         func_match = re.search(r"def\s+(\w+)\s*\(", forward_source)
         if func_match and func_match.group(1) != "forward":
-            # Find original forward in class to replace it
             orig_fwd = re.search(r"(\n\s+def\s+forward\s*\([^)]*\)[^:]*:.*?)(?=\n\s+def\s|\n\s+@|\Z)", full_class, re.DOTALL)
             if orig_fwd:
                 patched_forward_info = (func_match.group(1), orig_fwd.group(1))
                 disable = None  # Keep patched source as-is for renamed forward replacements
 
-    # Replace function name with module-specific name
     if patched_forward_info:
         source = forward_source  # Keep patched source as-is
     else:
@@ -1820,7 +1796,6 @@ def create_standalone_class(
     pass
     parameters = ", ".join(forwarding_parts)
 
-    # Now create the forward function!
     # When forward is patched, use the original forward definition from class source
     definition_source = patched_forward_info[1] if patched_forward_info else old_source
 
@@ -1840,7 +1815,6 @@ def create_standalone_class(
     definition = definition_matches[0]
     leftover = full_class[full_class.find(definition) + len(definition) :]
 
-    # Add **loss_kwargs
     if add_loss_kwargs and "**" not in parameters:
         parameters += ", **loss_kwargs"
         definition = re.sub(r"(\,[\n][\s]{1,}\))", r",**loss_kwargs\1", definition)
@@ -1856,11 +1830,9 @@ def create_standalone_class(
     source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
     full_class = full_class.replace(source_to_replace, new_forward)
 
-    # New init as well
     if new_init is not None:
         full_class = full_class.replace(old_init, new_init)
 
-    # New methods as well
     if new_methods is not None and isinstance(new_methods, dict):
         for method_name, method_source in new_methods.items():
             try:
@@ -1872,7 +1844,6 @@ def create_standalone_class(
                         f"Unsloth: Failed to replace method {method_name} in {module} with error = {str(e)}"
                     )
 
-    # Combine all into file
     source = source + full_class
     if supports_return_hidden_states:
         source += f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
@@ -2500,7 +2471,6 @@ def apply_fused_lm_head(forward, module=None):
             flags=re.MULTILINE,
         )
 
-        # Find matches
         if r"loss\_function" in cross_entropy_find and "loss_function" not in forward:
             if UNSLOTH_ENABLE_LOGGING:
                 print(
@@ -2732,7 +2702,6 @@ def apply_mask_attention_mask_out(source):
 pass
 
 
-# Patch remaining functions
 def convert_attention_masks_to_bool(module, old_source):
     # All Unsloth Zoo code licensed under LGPLv3
     source = re.sub(r"\([\s]{0,}", "(", old_source)
@@ -3132,7 +3101,6 @@ def patch_gradient_checkpointing(module, source):
     # Confirm no equal signs seen - might be "attention_mask=causal_mask_mapping" vs "attention_mask=attention_mask"
     if "=" in args:
         return None
-    # Also fix init
     spaces = init.find("def")
     init = init + "\n" + (spaces + 4) * " " + "self.gradient_checkpointing = False\n\n"
 
@@ -3422,7 +3390,6 @@ def patch_lora_forwards(torch_compile_options):
         source = "\n".join(x[spaces:] for x in source)
         old_hash = hash(source)
 
-        # Remove cloning
         source = source.replace("result = result.clone()", "")
 
         # Use addmm
@@ -3446,7 +3413,6 @@ def patch_lora_forwards(torch_compile_options):
             source = source.replace(old2, replace)
         pass
 
-        # Update function name
         source = source.replace(
             "def forward",
             "def unsloth_forward",
@@ -3683,7 +3649,6 @@ def patch_gradient_accumulation(modeling_file, module):
             flags=re.DOTALL | re.MULTILINE,
         )
 
-        # Remove double commas
         source = re.sub(r"\,[\s]{0,}\,", ",", source)
     else:
         return None
@@ -3735,7 +3700,6 @@ def fixup_fused_lm_head(source):
 pass
 
 
-# =====================================
 # Image models inside timm
 def rms_norm2d(
     x: torch.Tensor,
@@ -4376,7 +4340,6 @@ def unsloth_compile_transformers(
         print("Unsloth: Failed editing tqdm to replace Inductor Compilation:")
     pass
 
-    # torch_compile_options
     UNSLOTH_COMPILE_DEBUG = os.environ.get("UNSLOTH_COMPILE_DEBUG", "0") == "1"
     UNSLOTH_COMPILE_MAXIMUM = os.environ.get("UNSLOTH_COMPILE_MAXIMUM", "0") == "1"
     UNSLOTH_COMPILE_IGNORE_ERRORS = (
@@ -4455,7 +4418,6 @@ def unsloth_compile_transformers(
     has_mamba_ssm = compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING)
     has_fla_no_autotune = compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING)
 
-    # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
     if "UNSLOTH_RETURN_LOGITS" not in os.environ:
         os.environ["UNSLOTH_RETURN_LOGITS"] = UNSLOTH_RETURN_LOGITS
@@ -4463,7 +4425,6 @@ def unsloth_compile_transformers(
         UNSLOTH_RETURN_LOGITS = os.environ["UNSLOTH_RETURN_LOGITS"] == "1"
     pass
 
-    # Fullgraph
     UNSLOTH_FULLGRAPH = "1" if fullgraph else "0"
     if "UNSLOTH_FULLGRAPH" not in os.environ:
         os.environ["UNSLOTH_FULLGRAPH"] = UNSLOTH_FULLGRAPH
@@ -4732,7 +4693,6 @@ def unsloth_compile_transformers(
         torch_modules[module] = fullgraph if UNSLOTH_FULLGRAPH else False
     pass
 
-    # Get other classes
     other_classes = re.findall(r"class ([^\s]{1,})\(.+?\)", full_source)
     other_classes = [
         x for x in other_classes if x not in torch_modules and x not in removal
@@ -4870,7 +4830,6 @@ def unsloth_compile_transformers(
     # since torch.compile will compile too many kernels
     bad_torch_modules = set()
     no_fullgraph_modules = set()
-    # actively disable certain modules
     disable_modules = set()
     output_capture_target_names = patch_output_capture_targets(modeling_file)
     for module, fullgraph in torch_modules.items():
@@ -4964,7 +4923,6 @@ def unsloth_compile_transformers(
             disable_modules.add(module)
         pass
 
-        # Check for residual streams optimizations
         if fast_residual_stream and "residual" in source:
             new_source = patch_residual_stream(source)
             if new_source != source:
@@ -5083,7 +5041,6 @@ def unsloth_compile_transformers(
         pass
     pass
 
-    # Remove causal masks
     do_not_remove = False
     for module in remove_causal_masks:
         if module.endswith(("ForConditionalGeneration", "Gemma3Model", "Gemma4Model")):
@@ -5285,7 +5242,6 @@ def unsloth_compile_transformers(
         pass
     pass
 
-    # Manually replace hand written parts
     if manual_replacements:
         for module in compiler_replacements:
             if (
@@ -5387,7 +5343,6 @@ def unsloth_compile_transformers(
     exec(inner_training_loop, globals())
     Trainer._inner_training_loop = _fast_inner_training_loop
 
-    # All other functions
     if compile_function_calls:
         mask_functions = get_mask_functions()
         # Fix up function signatures
@@ -5441,7 +5396,7 @@ def unsloth_compile_transformers(
             for bad_param in bad_params:
                 parameters = re.sub(
                     re.escape(bad_param) + r"[\s]{0,}\=[\s]{0,}None[\s]{0,}\,",
-                    "",  # Remove them entirely
+                    "",
                     str(parameters),
                     flags=re.DOTALL,
                 )
@@ -5560,7 +5515,6 @@ def unsloth_compile_transformers(
         pass
     pass
 
-    # Order all components
     final_all_standalone_classes = []
     for module in ordered_functions:
         if module in all_standalone_classes:
@@ -5597,14 +5551,12 @@ def unsloth_compile_transformers(
         disable,
         combined_module,
     )
-    # Quick exit
     if combined_module is None or full_disable:
         print(
             f"Unsloth: Exit auto compiler with combined_module = {combined_module}, disable = {disable}"
         )
         return
 
-    # Import and replace with new module
     replacement_classes = {}
     for module in all_standalone_classes.keys():
         try:
@@ -5620,7 +5572,6 @@ def unsloth_compile_transformers(
 
     patch_output_capture_targets(modeling_file, replacement_classes)
 
-    # Finally edit dictionary items inside the target file
     replaced_classes = all_standalone_classes.keys()
     check_dicts = dir(eval(f"{model_location}"))
     for check in check_dicts:
