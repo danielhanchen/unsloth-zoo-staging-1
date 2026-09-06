@@ -124,7 +124,7 @@ def create_huggingface_repo(
     repo_url = api.create_repo(
         repo_id = repo_id,
         private = private,
-        exist_ok = True,  # don't error if repo already exists
+        exist_ok = True,
     )
     username = repo_id.split("/")[0]
 
@@ -390,7 +390,6 @@ def assert_same_keys(model, new_state_dict):
     def _normalize(key: str) -> str:
         if not (key.endswith(".weight") or key.endswith(".bias")):
             return ""
-        # strip helper wrappers
         key = key.replace(".base_layer", "")
         key = key.replace(".modules_to_save.default", "")
         key = key.replace(".original_module", "")
@@ -581,7 +580,6 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
         except Exception:
             pass
 
-    # Also return state_dict if needed
     if return_state_dict:
         old_state_dict = inner_model.state_dict()
         state_dict     = collections.OrderedDict()
@@ -702,7 +700,7 @@ def _merge_and_overwrite_lora(
         )
     pass
 
-    filename_original = os.path.join(save_directory, filename)  # Original file path
+    filename_original = os.path.join(save_directory, filename)
     count = 0
     # Collect keys for this shard so the caller can aggregate without re-reading the file (avoids
     # an extra safetensors pass purely for tied-embedding bookkeeping).
@@ -722,7 +720,6 @@ def _merge_and_overwrite_lora(
         raw_pointer = open(filename_original, "r+b")
         mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
 
-        # Parse safetensors header
         length_of_header = int.from_bytes(mm.read(8), "little")
         header_metadata = json.loads(mm.read(length_of_header))
         mm.seek(0)
@@ -746,7 +743,6 @@ def _merge_and_overwrite_lora(
                     idx = int(m.group(2))
                     moe_num_experts[prefix] = max(moe_num_experts.get(prefix, -1), idx + 1)
 
-            # Update converted_lora_weights with actual safetensor keys
             converted_lora_weights = _convert_lora_keys_to_safetensor_format(
                 lora_weights,
                 safetensor_keys,
@@ -1042,7 +1038,6 @@ def _merge_and_overwrite_lora(
         raise RuntimeError(f"Model merge failed with error: {e}") from e
 
     finally:
-        # Cleanup memory mapping
         if mm is not None:
             try:
                 mm.close()
@@ -2072,7 +2067,7 @@ pass
 def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
-    filename_original = os.path.join(save_directory, filename)  # Original file path
+    filename_original = os.path.join(save_directory, filename)
     tensors = OrderedDict()
     count = 0
     safetensor_keys_seen = set()
@@ -2080,25 +2075,22 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     import pickle
     limit = 700 * 1024 * 1024  # 700MB
 
-    # Convert lora_weights to safetensor format
     converted_lora_weights = _convert_lora_keys_to_safetensor_format(
         lora_weights,
         [],
         model_class_name = model_class_name,
     )
 
-    with safe_open(filename_original, framework = "pt", device = "cpu") as file: # Open original file for reading
+    with safe_open(filename_original, framework = "pt", device = "cpu") as file:
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
 
-        # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
             lora_weights,
             safetensor_keys,
             model_class_name = model_class_name,
         )
 
-        # Set to track mxfp4 keys that have already been processed
         processed_mxfp4_keys = set()
 
         for key in safetensor_keys:
@@ -2136,7 +2128,6 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 # Free the allocator before the large dequant alloc.
                 device_empty_cache()
 
-                # Pick device + chunk size for mxfp4 dequantization
                 device_type, device_id, rows_per_chunk = _choose_mxfp4_processing_strategy(
                     blocks_tensor, scales_tensor
                 )
@@ -2247,7 +2238,6 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
 
             with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
                 temp_filename = temp_file.name
-                # Save the merged tensor to a unique temp file
                 torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
                 del W
                 # Load it back as a memory-mapped object. The OS will manage paging this from disk.
@@ -2275,11 +2265,10 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     with tempfile.NamedTemporaryFile(suffix=".safetensors", dir=save_directory, delete=False) as tmpfile:
         temp_filename_safetensors = tmpfile.name
 
-    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})  # Save to the temporary safetensors file
+    save_file(tensors, temp_filename_safetensors, metadata={"format": "pt"})
 
-    # Replace the temporary file with the original file
     try:
-        os.replace(temp_filename_safetensors, filename_original)  # Attempt atomic rename
+        os.replace(temp_filename_safetensors, filename_original)
     except OSError as e:
         # If rename fails (e.g., due to permissions), fall back to copy and remove temporary file
         print(f"Error renaming temporary file: {e}. Attempting copy and replace.")
@@ -2300,7 +2289,6 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
         else:
             shutil.copy2(temp_filename_safetensors, filename_original)
 
-        # Clean up temp file
         try:
             os.remove(temp_filename_safetensors)
         except:
@@ -2678,7 +2666,6 @@ def prepare_saving(
     use_temp_file = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Check size
     from huggingface_hub.serialization._base import parse_size_to_int
     max_shard_size_in_bytes = max_shard_size
     if type(max_shard_size_in_bytes) is not int:
@@ -2696,7 +2683,6 @@ def prepare_saving(
             private = private,
             token = token,
         )
-        # Check if temporary folder is needed
         if os.path.isdir(save_directory) or use_temp_file:
             temp_file = tempfile.TemporaryDirectory(ignore_cleanup_errors = True)
             save_directory = temp_file.name
@@ -2714,7 +2700,6 @@ def prepare_saving(
     assert(type(torch.bfloat16) is torch.dtype)
     element_size = torch.tensor([], dtype = output_dtype).element_size()
 
-    # Get state_dict
     lora_weights, state_dict = create_lora_statistics(
         model,
         merge_into_original = merge_into_original,
@@ -2723,7 +2708,6 @@ def prepare_saving(
     # Total save size in bytes
     save_size = sum(get_torch_storage_size_new(x, element_size) for x in state_dict.values())
 
-    # Create folder if it does not exist
     if not os.path.exists(save_directory):
         try:
             os.makedirs(save_directory, exist_ok = True)
@@ -2775,7 +2759,6 @@ def prepare_saving(
                 f"Unsloth: Saving to {save_directory} will fail, but using a temp folder works! "\
                 "Switching to a temp folder then uploading!"
             )
-            # Switch to temp directory
             temp_file = try_temp_file
             save_directory = try_save_directory
             use_temp_file = True
@@ -2818,7 +2801,6 @@ def _remove_quantization_config(config_path: Path):
         return removed
     if not _strip_quantization_config(config):
         return
-    # Overwrite the config file
     with open(config_path, "w", encoding = "utf-8") as f:
         json.dump(config, f, indent = 4)
     pass
@@ -2899,7 +2881,6 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     #     if len(shard_str) != len(total_str):
     #         return False
 
-    # same prefix and total
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
@@ -3065,20 +3046,15 @@ def merge_and_overwrite_lora(
                 max_size_in_bytes = max(max_size_in_bytes, file_size)
                 total_size_in_bytes += file_size
 
-            # Check for index file
             index_path = os.path.join(model_name, "model.safetensors.index.json")
             if os.path.exists(index_path):
                 try:
                     with open(index_path, 'r', encoding = "utf-8") as f:
                         index_data = json.load(f)
-                        # Extract file names from the index if available
                         if "weight_map" in index_data:
-                            # Get unique filenames from weight map
                             indexed_files = set(index_data["weight_map"].values())
-                            # Only use these if we didn't find files directly
                             if not safetensors_list:
                                 safetensors_list = list(indexed_files)
-                                # Need to compute sizes for these files
                                 for file in safetensors_list:
                                     file_path = os.path.join(model_name, file)
                                     if os.path.exists(file_path):
@@ -3109,11 +3085,9 @@ def merge_and_overwrite_lora(
             tokenizer_model_path = os.path.join(model_name, "tokenizer.model")
             if os.path.exists(tokenizer_model_path):
                 os.makedirs(save_directory, exist_ok=True)
-                # Copy from local
                 shutil.copy2(tokenizer_model_path, os.path.join(save_directory, "tokenizer.model"))
                 print(f"Copied tokenizer.model from local model directory")
         else:
-            # Original HF repo logic
             # Third Hub round trip on this path, and it had the same bare `except:` as
             # the other two: an unreachable Hub was reported as "Could not determine
             # original model ID", a claim about the name rather than the network.
@@ -3214,7 +3188,6 @@ def merge_and_overwrite_lora(
             try:
                 model_name = get_model_name(model_name.removesuffix("-BF16"), load_in_4bit = False)
                 print(f"Unsloth: Found MXFP4 variant = `{model_name}`")
-                # Re-get all meta-data from scratch
                 safetensors_list = []
                 max_size_in_bytes = 0
                 total_size_in_bytes = 0
@@ -3222,7 +3195,6 @@ def merge_and_overwrite_lora(
             except:
                 pass
         pass
-        # Stop loop and continue
         break
     pass
 
@@ -3254,7 +3226,6 @@ def merge_and_overwrite_lora(
         if not getattr(model.config, "quantization_config", None):
              raise ValueError("Model does not appear to be quantized. Cannot use 'merged_4bit'.")
 
-        # Perform the merge
         try:
             # Use the base_model reference which points to the PeftModel's base
             merged_model = base_model.merge_and_unload()
@@ -3262,13 +3233,12 @@ def merge_and_overwrite_lora(
         except Exception as e:
             raise RuntimeError(f"Failed to merge LoRA weights for 4-bit save: {e}")
 
-        # Check for skipped modules (optional but good practice)
         skipped_modules, _ = find_skipped_quantized_modules(merged_model)
         if len(skipped_modules) > 0:
             print(f"Unsloth: Found skipped modules: {skipped_modules}. Updating config.")
             # Ensure quantization_config exists before modifying
             if not hasattr(merged_model.config, "quantization_config"):
-                merged_model.config.quantization_config = {} # Initialize if somehow missing
+                merged_model.config.quantization_config = {}
             merged_model.config.quantization_config["llm_int8_skip_modules"] = skipped_modules
 
         print(f"Unsloth: Saving merged 4bit model to {save_directory}...")
@@ -3279,11 +3249,9 @@ def merge_and_overwrite_lora(
              raise RuntimeError(f"Failed to save merged 4-bit model: {e}")
         fix_tokenizer_config_json(tokenizer, save_directory)
 
-        # Upload the saved 4-bit model files
         if push_to_hub:
-            upload_items() # Upload the entire directory content
+            upload_items()
 
-        # Clean up temp file if created
         if cleanup_temp_file and temp_file is not None:
             print("Unsloth: Cleaning up temporary file...")
             try: temp_file.cleanup()
@@ -3364,7 +3332,6 @@ def merge_and_overwrite_lora(
     if not _is_quant_dequant and not needs_splitting:
         if is_local_path:
             os.makedirs(save_directory, exist_ok = True)
-            # Copy from local
             if safe_tensor_index_files:
                 local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
@@ -3376,7 +3343,6 @@ def merge_and_overwrite_lora(
                         print(f"Error copying model.safetensors.index.json: {e}")
                         raise e
         else:
-            # Download from HF
             if "model.safetensors.index.json" in [f for f in safe_tensor_index_files]:
                 snapshot_download(
                     repo_id = model_name,
@@ -3617,7 +3583,6 @@ def merge_and_overwrite_lora(
 
         # --- NEW LOGIC: Build the weight_map BEFORE deleting the file ---
         if regenerate_index and not _fp8_post_cleanup:
-            # We must open the file we just created to get its tensor keys
             with safe_open(file_path, framework = "pt", device = "cpu") as f:
                 for key in f.keys():
                     weight_map[key] = filename
@@ -3665,7 +3630,6 @@ def merge_and_overwrite_lora(
     # Step 7: Final upload of all shards if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:
 
-        # Explicitly upload all safetensors files if not already handled
         for filename in safetensors_list:
             upload_items(filename)
         upload_items()
@@ -3764,7 +3728,7 @@ def _try_copy_all_from_cache(
                 cache_dir = hf_cache_dir,
                 token = token,
             )
-            cached_paths_map[filename] = Path(cached_path_str) # Store Path for checking
+            cached_paths_map[filename] = Path(cached_path_str)
         except LocalEntryNotFoundError:
             print(f"Cache check failed: {filename} not found in local cache.") # Verbose
             all_found = False
@@ -3779,7 +3743,6 @@ def _try_copy_all_from_cache(
         return False
 
     try:
-        # Create target directory using os.makedirs
         os.makedirs(target_dir_str, exist_ok = True)
         if not os.access(target_dir_str, os.W_OK | os.X_OK):
              raise PermissionError(f"No write/execute permission for target directory: {target_dir_str}")
@@ -3790,7 +3753,6 @@ def _try_copy_all_from_cache(
     all_copied = True
     for filename, cached_path in ProgressBar(cached_paths_map.items(), desc = f"Unsloth: Copying {len(filenames_to_check)} files from cache to `{target_dir_str}`"):
         try:
-            # Pass string target_dir_str to copy helper
             _copy_file_from_source(cached_path, target_dir_str, filename)
         except (IOError, PermissionError, FileNotFoundError) as copy_err:
              print(f"Cache copy failed: Error copying {filename} from {cached_path} to {target_dir_str}: {copy_err}")
@@ -3811,7 +3773,7 @@ pass
 def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, filename: str):
     """Copies a file from src_path to target_dir_str/filename using os.path."""
     src_path = Path(src_path) # Keep Path for source checking ease
-    dst_path = os.path.join(target_dir_str, filename) # Use os.path.join for destination
+    dst_path = os.path.join(target_dir_str, filename)
 
     if not src_path.is_file():
         raise FileNotFoundError(f"Source {src_path} is not a valid file.")
@@ -3819,7 +3781,7 @@ def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, file
          raise PermissionError(f"No read permission for source file: {src_path}")
     # Target dir creation and permission check is handled by caller (_try_copy_all_from_cache)
     try:
-        shutil.copy2(str(src_path), dst_path) # Use string paths for shutil
+        shutil.copy2(str(src_path), dst_path)
     except Exception as e:
         raise IOError(f"Failed to copy {src_path} to {dst_path}: {e}") from e
 pass
@@ -3843,7 +3805,6 @@ def _get_hf_cache_dir() -> Optional[Path]:
                     print(f"Warning: Found cache directory {cache_dir}, but lack R/W/X permissions. Cannot use cache.")
                     return None
             elif cache_dir.exists():
-                 # Exists but not a directory: bail
                  print(f"Warning: Path {cache_dir} exists but is not a directory. Cannot use cache.")
                  return None
         except Exception as e:
@@ -4048,7 +4009,6 @@ def merge_and_dequantize_lora(
             tokenizer.save_pretrained(save_directory = save_directory)
         return
 
-    # Now patch for incremental pushing to hub
     if push_to_hub:
         save_pretrained = incremental_save_pretrained(
             save_pretrained = save_pretrained,
@@ -4328,7 +4288,7 @@ def _infer_prefix_and_remap(lora_weights, safetensor_keys):
     remapped = defaultdict(lora_weights.default_factory)
     changed = False
     inferred_prefixes = []  # track prefixes from successful per-key matches
-    unmatched_keys = []     # keys that couldn't be matched at all
+    unmatched_keys = []
 
     for k, v in lora_weights.items():
         if not isinstance(k, str):
@@ -5096,7 +5056,6 @@ def check_local_model_exists(model_path):
         if os.path.exists(target_path):
             return target_path
 
-        # Split path into components
         parts = target_path.split(os.sep)
         current_path = ""
 
@@ -5113,11 +5072,9 @@ def check_local_model_exists(model_path):
             else:
                 current_path = os.path.join(current_path, part)
 
-            # If this exact path exists, continue
             if os.path.exists(current_path):
                 continue
 
-            # Try to find case-insensitive match
             parent_path = os.path.dirname(current_path) if i > 0 else "."
             target_name = os.path.basename(current_path).lower()
 
@@ -5139,25 +5096,19 @@ def check_local_model_exists(model_path):
 
         return current_path if os.path.exists(current_path) else None
 
-    # List of path patterns to check
     paths_to_check = []
 
-    # 1. Exact path as given
     paths_to_check.append(model_path)
 
-    # 2. Case-insensitive version of full path
     case_insensitive_full = find_case_insensitive_path(model_path)
     if case_insensitive_full:
         paths_to_check.append(case_insensitive_full)
 
-    # 3. If path contains "/", also check just the model name part
     if "/" in model_path:
-        model_name = model_path.split("/")[-1]  # Get part after last "/"
+        model_name = model_path.split("/")[-1]
 
-        # Exact model name
         paths_to_check.append(model_name)
 
-        # Case-insensitive model name in current directory
         try:
             for item in os.listdir("."):
                 if item.lower() == model_name.lower():
@@ -5166,7 +5117,6 @@ def check_local_model_exists(model_path):
         except (OSError, PermissionError):
             pass
 
-    # Remove duplicates while preserving order
     seen = set()
     unique_paths = []
     for path in paths_to_check:
@@ -5174,10 +5124,9 @@ def check_local_model_exists(model_path):
             seen.add(path)
             unique_paths.append(path)
 
-    # Check each path and verify it contains safetensors
     for path in unique_paths:
         if has_safetensors(path):
-            return os.path.abspath(path)  # Return absolute path
+            return os.path.abspath(path)
 
     return None
 pass
@@ -5256,12 +5205,10 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
     believed were 16bit: a wrong merge rather than no merge.
     """
     config = None
-    # Local path
     if local_ok and os.path.exists(model_name_or_path) and os.path.isdir(model_name_or_path):
         config_path = os.path.join(model_name_or_path, "config.json")
         if os.path.exists(config_path):
             config = _load_quant_config_or_raise(config_path, model_name_or_path)
-    # HF repo
     else:
         # Fetch and parse are separate `try`s because their failures mean opposite
         # things and one exception class covers both: `json.JSONDecodeError` and
@@ -5659,7 +5606,7 @@ def determine_base_model_source(model_name, token=None, save_method=None):
         return (local_path, True, "local_unquantized", False, None)
 
     # Priority 2: Local mxfp4
-    if local_path and local_is_quantized and local_quant_type == "mxfp4":  # local_quant_type == "mxfp4"
+    if local_path and local_is_quantized and local_quant_type == "mxfp4":
         return (local_path, True, "local_mxfp4", True, "mxfp4")
 
     # Only now can the Hub change the answer, so only now is it consulted, and an
@@ -5723,7 +5670,6 @@ def get_memory_stats():
     stats = {}
     import psutil
 
-    # CPU Memory
     cpu_mem = psutil.virtual_memory()
     stats['cpu'] = {
         'total': cpu_mem.total,
@@ -5733,7 +5679,6 @@ def get_memory_stats():
         'free': cpu_mem.available,  # Available is more accurate than free
     }
 
-    # GPU Memory (for each GPU)
     stats['gpus'] = []
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
@@ -5774,7 +5719,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     """
     import math
 
-    # Calculate tensor dimensions
     *prefix_shape, G, B = blocks_tensor.shape
     rows_total = math.prod(prefix_shape) * G
 
@@ -5785,7 +5729,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     output_size = rows_total * B * 2 * 2
     persistent_memory = input_size + output_size
 
-    # Device-specific safety factors
     GPU_SAFETY_FACTOR = 0.75  # GPUs can handle higher utilization
     CPU_SAFETY_FACTOR = 0.75  # CPUs need more headroom for OS and other processes
 
@@ -5842,7 +5785,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
                 'combined_score': combined_score,
             })
 
-    # Check CPU strategy
     cpu_safe_usable_memory = calculate_safe_usable_memory(
         free_memory=stats['cpu']['available'],
         safety_factor=CPU_SAFETY_FACTOR,
@@ -5852,7 +5794,7 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     if cpu_chunk_size:
         temp_memory = min(cpu_chunk_size, rows_total) * base_memory_per_row
         total_memory_needed = persistent_memory + temp_memory
-        combined_score = calculate_combined_score(1.0, cpu_chunk_size)  # For CPU
+        combined_score = calculate_combined_score(1.0, cpu_chunk_size)
         suitable_strategies.append({
             'device_type': 'cpu',
             'device_id': None,
@@ -5871,7 +5813,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
 
     if suitable_strategies:
 
-        # Sort by combined score
         suitable_strategies.sort(key=lambda x: x['combined_score'], reverse=True)
 
         best = suitable_strategies[0]
@@ -5891,7 +5832,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     # Fallback: find device with most memory and use minimal chunk
     fallback_options = []
 
-    # Add CPU fallback
     fallback_options.append({
         'device_type': 'cpu',
         'device_id': None,
@@ -5899,7 +5839,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
         'total_available': stats['cpu']['available']
     })
 
-    # Add GPU fallbacks
     for gpu in stats['gpus']:
         fallback_options.append({
             'device_type': DEVICE_TYPE_TORCH,  # 'cuda' on ROCm (PyTorch alias)
@@ -5912,7 +5851,6 @@ def _choose_mxfp4_processing_strategy(blocks_tensor, scales_tensor):
     fallback_options.sort(key=lambda x: x['available'], reverse=True)
     best_fallback = fallback_options[0]
 
-    # Calculate minimal safe chunk size for fallback
     remaining_memory = best_fallback['available'] - persistent_memory
     if remaining_memory > 0:
         fallback_chunk_size = max(1024, min(8192, int(remaining_memory // base_memory_per_row), rows_total))
@@ -5959,17 +5897,16 @@ def split_safetensor_file(filename, save_directory, max_shard_size_gb=2):
     max_shard_size_bytes = max_shard_size_gb * 1024 * 1024 * 1024
 
     if file_size <= max_shard_size_bytes:
-        return [filename]  # No splitting needed
+        return [filename]
 
     print(f"Splitting {filename} (size: {file_size / (1024**3):.2f} GB)...")
 
     try:
-        # Split into shards
         shards = split_safetensors_to_shards(file_path, max_shard_size_gb)
 
         # Create temporary filenames to avoid messy nested numbering
         import uuid
-        temp_base = str(uuid.uuid4())[:8]  # Short unique ID
+        temp_base = str(uuid.uuid4())[:8]
         temp_filenames = []
 
         for i, shard in enumerate(shards):
@@ -5982,7 +5919,6 @@ def split_safetensor_file(filename, save_directory, max_shard_size_gb=2):
             if UNSLOTH_ENABLE_LOGGING:
                 logger.info(f"Created temp chunk: {temp_filename} (size: {shard_size / (1024**3):.2f} GB)")
 
-        # Remove original file
         os.remove(file_path)
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Removed original file: {filename}")
@@ -5997,7 +5933,6 @@ pass
 def renumber_safetensor_files(file_list, save_directory):
     """Renumber all files with clean sequential names."""
     if len(file_list) <= 1:
-        # Single file - rename to model.safetensors
         if len(file_list) == 1 and file_list[0] != "model.safetensors":
             old_path = os.path.join(save_directory, file_list[0])
             new_path = os.path.join(save_directory, "model.safetensors")
@@ -6008,14 +5943,12 @@ def renumber_safetensor_files(file_list, save_directory):
             return ["model.safetensors"]
         return file_list
 
-    # Multiple files - use clean numbering
     total_files = len(file_list)
     clean_names = [f"model-{i+1:05d}-of-{total_files:05d}.safetensors" for i in range(total_files)]
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: Renumbering safetensor files with sequential numbering...")
 
-    # Create mapping of old -> new names
     rename_pairs = list(zip(file_list, clean_names))
 
     # Rename files (handle potential conflicts with temp names)
@@ -6249,7 +6182,6 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         key_metadata = header_metadata[output_key]
         index_L, index_R = key_metadata["data_offsets"]
 
-        # Adjust for header offset
         index_L += 8 + length_of_header
         index_R += 8 + length_of_header
 
@@ -6272,7 +6204,6 @@ def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key
         tensor_view = tensor_formatted.detach().reshape(-1).view(torch.uint8)
         mm[index_L:index_R] = memoryview(tensor_view.numpy())
 
-        # Clear memory
         del tensor_view
         del tensor_formatted
         del tensor
