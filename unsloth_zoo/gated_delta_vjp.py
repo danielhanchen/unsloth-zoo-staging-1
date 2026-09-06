@@ -1133,17 +1133,22 @@ def gated_delta_kernel_supported(q, g, mask, v=None, k=None) -> bool:
     """Whether the fused-kernel VJP path can handle this call.
 
     A caller omitting `v` or `k` gets False, not a yes the dispatch would refuse.
+
+    Device first: _blocked_layouts reads `dtype.size`, which only a real mx.Dtype
+    has, so off Metal this has to answer False before reaching it rather than
+    raise. tests/mlx_simulation hands out torch dtypes, so a training call under
+    the shim died in the layout search instead of falling back to the ops VJP.
     """
     return (
-        mask is None
+        mx.metal.is_available()
+        and mx.default_device() == mx.gpu
+        and mask is None
         and v is not None
         and k is not None
         and _blocked_shares_q_dtype(q, k, v)
         and g.ndim in (3, 4)
         and q.shape[-1] % 32 == 0
         and _blocked_layouts(q, g, v) is not None
-        and mx.default_device() == mx.gpu
-        and mx.metal.is_available()
     )
 
 
