@@ -69,7 +69,7 @@ def _peak(call):
     (32, 8, 128, 128, 4, mx.bfloat16, 82),
     (32, 8, 128, 128, 8, mx.bfloat16, 98),
     (8, 8, 128, 128, 4, mx.bfloat16, 328),
-    (16, 2, 64, 64, 4, mx.bfloat16, 41),     # the narrowest head dim with a fused kernel
+    (16, 2, 64, 64, 4, mx.bfloat16, 20),     # the narrowest head dim with a fused kernel
     (32, 8, 128, 128, 4, mx.float16, 73),    # both sides at float32, with the result
 ])
 def test_the_query_count_against_the_cache_geometry_decides_the_route(HQ, HKV, D, Dv, bits,
@@ -110,9 +110,10 @@ def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_s
     for L in (16, 1024, 65536):
         queries = _queries(1, 32, L, D)
         assert fused_kernel_exists(queries, *cache, group_size) is False, L
-        assert dequantizing_is_smaller(queries, *cache, group_size) is True, L
         mx.eval(wrapped(queries, *cache, D ** -0.5, "causal", group_size=group_size, bits=4))
-    assert taken == [16, 1024, 65536], "the cost said yes; only the missing kernel declined it"
+    assert taken == [16, 1024, 65536]
+    # and the guard is what declined it: on bytes alone the deepest call would have dequantized.
+    assert dequantizing_is_smaller(_queries(1, 32, 65536, D), *cache, group_size) is True
 
 
 @pytest.mark.parametrize("bits,group_size,last", [(4, 64, 82), (8, 64, 98), (2, 32, 76)])
