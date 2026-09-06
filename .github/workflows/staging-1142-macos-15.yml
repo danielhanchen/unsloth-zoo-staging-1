@@ -16,10 +16,7 @@ defaults:
 jobs:
   test:
     runs-on: macos-15
-    timeout-minutes: 30
-    env:
-      UNSLOTH_COMPILE_DISABLE: '1'
-      UNSLOTH_IS_PRESENT: '1'
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,5 +24,102 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install -e . pytest pytest-asyncio pytest-timeout && { python -m pip install --no-deps 'unsloth @ git+https://github.com/unslothai/unsloth@main' || true; }
-      - run: rc=0; python -m pytest tests/test_mlx_gated_delta_vjp.py tests/test_qwen35_vjp_metal.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
+      - name: Runner identity
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+      # Same recipe as the repo's own mlx-ci.yml: pyproject gates torch OFF on
+      # darwin+arm64, but tests/mlx_simulation/__init__.py imports it
+      # unconditionally, so the CPU wheel goes in first or collection dies.
+      # unsloth satisfies the find_spec guard in unsloth_zoo/__init__.py.
+      - name: Install zoo with MLX extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx]
+          pip install pytest==9.0.3
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+      # Whether the MLX tests below are a real gate or a no-op comes down to
+      # mx.metal.is_available() on a GitHub-hosted VM. Record it explicitly, so a
+      # green job cannot be read as "the Metal kernels passed" when every Metal
+      # test skipped.
+      - name: MLX / Metal capability probe
+        id: probe
+        run: |
+          python - <<'EOF' | tee probe.txt
+          import platform
+          print("arch:", platform.machine())
+          import mlx.core as mx
+          from importlib.metadata import version
+          for name in ("mlx", "mlx-lm", "mlx-vlm"):
+              try:
+                  print(f"{name}=={version(name)}")
+              except Exception as error:
+                  print(f"{name}: {error}")
+          try:
+              avail = mx.metal.is_available()
+          except Exception as error:
+              print("metal probe failed:", error); avail = False
+          print("metal_available:", avail)
+          print("default_device:", mx.default_device())
+          if avail:
+              a = mx.random.normal((256, 256)); mx.eval(a @ a.T)
+              print("gpu matmul ok")
+          print("METAL=1" if avail else "METAL=0")
+          EOF
+          if grep -q '^METAL=1' probe.txt; then echo "metal=1" >> "$GITHUB_OUTPUT"; else echo "metal=0" >> "$GITHUB_OUTPUT"; fi
+      # Two deviations from a plain pytest call, both taken from mlx-ci.yml:
+      #   * the files run in SEPARATE processes -- the PR reports a pre-existing
+      #     cross-file failure when both are collected together, reproducible on
+      #     the merge base;
+      #   * _run_then_exit_hard.py, because mlx 0.32.1 segfaults (exit 139) at
+      #     interpreter shutdown after a fused Metal kernel, with every test
+      #     passing. The wrapper returns pytest's own code, so a real failure
+      #     still fails the job.
+      - name: tests/test_mlx_gated_delta_vjp.py
+        run: |
+          rc=0
+          python tests/_run_then_exit_hard.py tests/test_mlx_gated_delta_vjp.py -v -rs > out_a.txt 2>&1 || rc=$?
+          cat out_a.txt
+          exit "$rc"
+      - name: tests/test_qwen35_vjp_metal.py
+        if: always()
+        run: |
+          rc=0
+          python tests/_run_then_exit_hard.py tests/test_qwen35_vjp_metal.py -v -rs > out_b.txt 2>&1 || rc=$?
+          cat out_b.txt
+          exit "$rc"
+      - name: tests/test_mlx_gated_delta_batch_grad.py
+        if: always()
+        run: |
+          rc=0
+          python tests/_run_then_exit_hard.py tests/test_mlx_gated_delta_batch_grad.py -v -rs > out_c.txt 2>&1 || rc=$?
+          cat out_c.txt
+          exit "$rc"
+      - name: Summary (did the Metal tests actually run?)
+        if: always()
+        run: |
+          {
+            echo '## macos-15 MLX result'
+            echo '```'
+            cat probe.txt 2>/dev/null || echo 'no probe output'
+            echo '```'
+            for f in out_a.txt out_b.txt out_c.txt; do
+              echo "### $f"
+              echo '```'
+              tail -6 "$f" 2>/dev/null || echo 'step did not produce output'
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.probe.outputs.metal }}" != "1" ]; then
+            echo "::warning::No Metal GPU on this runner - the Metal-only tests skipped, so this job does NOT validate the fused kernels."
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-1142-macos-15-logs
+          path: |
+            probe.txt
+            out_a.txt
+            out_b.txt
+            out_c.txt
