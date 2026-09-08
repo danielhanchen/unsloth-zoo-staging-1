@@ -1,12 +1,22 @@
-"""The down-projection LoRA delta must be scattered back to token order.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-The second grouped GEMM runs with permute_y=True, so its output is in token
-order, but the down-LoRA delta stays expert-sorted and must be scattered through
-gather_indices before the add. Without it the LoRA rows land on the wrong tokens
-and the gradients are silently wrong.
-
-Runs on CPU against fake unsloth.kernels modules with the documented
-grouped_gemm permute semantics.
+"""The second grouped GEMM runs permute_y=True, so its output is in token order
+while the down-LoRA delta stays expert-sorted: without scattering the delta
+through gather_indices the LoRA rows land on the wrong tokens.
 """
 
 import sys
@@ -31,12 +41,9 @@ def _reference_grouped_gemm(
     permute_y=False,
     **kwargs,
 ):
-    """Pure-torch grouped GEMM with the documented permute semantics.
-
-    W is (E, N, K) and each expert computes ``Y = X @ W[e].T``. ``permute_x``
-    gathers token-order rows into expert-sorted order (``X[gather_indices // topk]``);
-    ``permute_y`` scatters the expert-sorted output back to token order
-    (``Y[argsort(gather_indices)]``). Differentiable.
+    """Pure-torch grouped GEMM implementing the documented permute semantics:
+    ``permute_x`` gathers token-order rows into expert-sorted order, ``permute_y``
+    scatters the expert-sorted output back to token order.
     """
     if permute_x:
         X = X[gather_indices // topk]
@@ -52,11 +59,6 @@ def _reference_grouped_gemm(
 
 
 def _install_fake_unsloth_kernels(monkeypatch):
-    """Install fake unsloth.kernels modules so the Triton forward runs on CPU.
-
-    ``setitem`` overrides any real installed unsloth for the test duration and
-    restores it afterwards.
-    """
     parent = None
     for name in (
         "unsloth",
@@ -86,23 +88,19 @@ def _install_fake_unsloth_kernels(monkeypatch):
 
 
 def _build_experts(num_experts, hidden, intermediate):
-    """Minimal `experts` module for the Triton grouped-GEMM forward."""
     experts = nn.Module()
     experts.num_experts = num_experts
-    # Canonical (E, out, in) storage: gate_up (E, 2*I, H), down (E, H, I).
     experts.gate_up_proj = nn.Parameter(
         torch.randn(num_experts, 2 * intermediate, hidden)
     )
     experts.down_proj = nn.Parameter(torch.randn(num_experts, hidden, intermediate))
     experts.act_fn = F.silu
-    # Pre-set so the forward skips the CUDA autotune / empty_cache branch;
-    # the fake grouped_gemm ignores the (None, None, None) kernel configs.
+    # Pre-set so the forward skips the CUDA autotune / empty_cache branch.
     experts._unsloth_moe_configs = (intermediate, (None, None, None), (None, None, None))
     return experts
 
 
 def _reference_forward(experts, X, top_k_index, top_k_weights, first, second, scaling):
-    """Naive per-token / per-k reference with down-LoRA only."""
     num_tokens, hidden = X.shape
     top_k = top_k_index.shape[1]
     out = torch.zeros(num_tokens, hidden)
@@ -120,10 +118,8 @@ def _reference_forward(experts, X, top_k_index, top_k_weights, first, second, sc
 
 
 def _setup(monkeypatch):
-    """Common fixture: fake kernels + CPU LoRA grouped-mm + seeded inputs."""
     _install_fake_unsloth_kernels(monkeypatch)
-    # The LoRA delta path calls the module global at call time; route it to the
-    # CPU per-group matmul so no CUDA _grouped_mm is needed.
+    # The LoRA delta path reads this module global at call time; no CUDA needed.
     monkeypatch.setattr(moe_utils, "native_moe_grouped_mm", moe_utils._manual_grouped_mm)
 
     num_experts, hidden, intermediate, rank = 4, 16, 12, 4
@@ -131,8 +127,8 @@ def _setup(monkeypatch):
 
     torch.manual_seed(0)
     experts = _build_experts(num_experts, hidden, intermediate)
-    first = torch.randn(num_experts, intermediate, rank)   # (E, in, R)
-    second = torch.randn(num_experts, rank, hidden)        # (E, R, out)
+    first = torch.randn(num_experts, intermediate, rank)
+    second = torch.randn(num_experts, rank, hidden)
     scaling = 0.5
 
     X = torch.randn(num_tokens, hidden)
@@ -180,14 +176,7 @@ def test_down_lora_grads_match_reference(monkeypatch):
 
 
 def test_down_lora_promotes_a_wider_scaling_tensor(monkeypatch):
-    """A non-0-dim `scaling` tensor in a wider dtype must not break the scatter.
-
-    ``lora_delta * scaling`` promotes when ``scaling`` is a tensor with at least one
-    dimension, so the delta can arrive wider than the GEMM output. The plain add this
-    replaced promoted silently; ``index_add_`` would raise on the dtype mismatch, so
-    the scatter has to promote too. A 0-dim tensor does not promote and is covered by
-    the float case above.
-    """
+    """A non-0-dim `scaling` promotes the delta past the output dtype, which index_add_ rejects."""
     experts, first, second, _, X, top_k_index, top_k_weights = _setup(monkeypatch)
 
     experts._unsloth_lora_down_proj = (first, second, 0.5)
@@ -202,12 +191,7 @@ def test_down_lora_promotes_a_wider_scaling_tensor(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_down_lora_matches_reference_on_real_kernels():
-    """Same check on the real Triton grouped GEMM, bf16, on the GPU.
-
-    The fake-kernel tests above assume the documented permute semantics; this
-    one runs the real kernel and the real LoRA delta path. CI has no GPU, so it
-    runs wherever a reviewer runs it.
-    """
+    """Same check against the real kernel, whose permute semantics the tests above assume."""
     pytest.importorskip("unsloth.kernels.moe.grouped_gemm.interface")
     from unsloth.kernels.moe.grouped_gemm.kernels.tuning import (
         KernelConfigBackward_dW,
@@ -229,8 +213,7 @@ def test_down_lora_matches_reference_on_real_kernels():
     experts.down_proj = nn.Parameter(
         (torch.randn(num_experts, hidden, intermediate, device=device) * 0.2).to(dtype)
     )
-    # Default configs (TMA off) so the forward skips autotune; the reduction
-    # dims are multiples of the 32-wide K block the kernel asserts on.
+    # Reduction dims must stay multiples of the 32-wide K block the kernel asserts on.
     configs = lambda: (KernelConfigForward(), KernelConfigBackward_dX(), KernelConfigBackward_dW())
     experts._unsloth_moe_configs = (intermediate, configs(), configs())
 
@@ -247,7 +230,6 @@ def test_down_lora_matches_reference_on_real_kernels():
 
     out = forward_triton_grouped_gemm(experts, X, top_k_index, top_k_weights)
 
-    # fp32 reference, one expert at a time.
     first_ref = first.detach().float().requires_grad_(True)
     second_ref = second.detach().float().requires_grad_(True)
     ref = torch.zeros(num_tokens, hidden, device=device)
@@ -261,8 +243,7 @@ def test_down_lora_matches_reference_on_real_kernels():
     out.float().sum().backward()
     ref.sum().backward()
 
-    # bf16 rounds at every stage, so allow 2% of the reference range; the
-    # row-order bug puts the forward off by about half of it.
+    # bf16 rounds at every stage, so allow 2% of the reference range.
     def check(got, want):
         assert (got.float() - want).abs().max() <= 0.02 * want.abs().max()
 

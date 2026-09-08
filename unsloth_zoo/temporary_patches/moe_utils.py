@@ -2080,14 +2080,12 @@ def forward_triton_grouped_gemm(
             grouped_mm_func=native_moe_grouped_mm
         )
 
-        # The second GEMM ran permute_y=True, so second_gemm_output is back in token
-        # order while lora_delta is still expert-sorted. Scatter it to match.
+        # permute_y=True put second_gemm_output in token order; lora_delta is still
+        # expert-sorted, so scatter it rather than adding it row-for-row.
         if lora_delta.dtype == second_gemm_output.dtype:
             second_gemm_output.index_add_(0, gather_indices, lora_delta)
         else:
-            # index_add_ requires both operands to share a dtype, but the plain add
-            # this replaces promoted instead. A non-0-dim `scaling` tensor in a wider
-            # dtype hits exactly that, so keep promoting rather than raising.
+            # index_add_ requires matching dtypes; the plain add this replaced promoted.
             promoted = torch.promote_types(second_gemm_output.dtype, lora_delta.dtype)
             second_gemm_output = second_gemm_output.to(promoted).index_add(
                 0, gather_indices, lora_delta.to(promoted)
