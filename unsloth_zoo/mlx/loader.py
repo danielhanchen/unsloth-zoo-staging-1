@@ -302,6 +302,22 @@ def _mlx_dora_wrapper_type(module, path):
     # but returns a tuple its caller destructures, so a wrapper returning one
     # array attaches cleanly and then breaks the next forward.
     if type(module) in (nn.Linear, nn.QuantizedLinear):
+        # DoRALinear.from_base recovers the unpacked width as
+        # `input_dims *= 32 // linear.bits`, which is exact only when bits
+        # divides 32. At 3, 5 or 6 it truncates, so lora_a is built against
+        # the wrong input dimension and the wrapper raises a bare matmul
+        # shape error on its first forward. Plain LoRA is unaffected, so
+        # refuse here rather than hand back a wrapper that cannot run.
+        bits = getattr(module, "bits", None)
+        if bits is not None and 32 % int(bits):
+            raise ValueError(
+                f"Unsloth MLX: DoRA cannot wrap {path or type(module).__name__} "
+                f"({int(bits)}-bit quantized); mlx-lm's DoRA wrapper only "
+                "recovers the unpacked width for bit widths that divide 32 "
+                "(2, 4, 8), and builds an unusable wrapper otherwise. "
+                "Requantize the base at 4 or 8 bits, or train with "
+                "use_dora=False."
+            )
         return DoRALinear
     raise ValueError(
         f"Unsloth MLX: DoRA cannot wrap {path or type(module).__name__} "
@@ -8878,6 +8894,28 @@ class FastMLXModel:
                     "seeded from the base weight and would not match the "
                     "randomized adapter. Use init_lora_weights=True (or "
                     "'gaussian'), or train with use_dora=False."
+                )
+            # Same reason as the vision refusal below, but about the tree
+            # rather than the request: a base that already carries plain-LoRA
+            # wrappers outside this selection (a previously adapted vision
+            # tower, a resumed adapter) keeps them, and the saved artifact
+            # still records one adapter type for the whole tree.
+            from .utils import iter_mlx_lora_modules
+
+            existing = sorted({
+                type(module).__name__
+                for _name, module in iter_mlx_lora_modules(model)
+                if not type(module).__name__.startswith("DoRA")
+            })
+            if existing:
+                raise ValueError(
+                    "Unsloth MLX: DoRA cannot be added to a model that "
+                    f"already carries {', '.join(existing)} adapter "
+                    "modules; the saved adapter records a single type for "
+                    "the whole tree, so the mixed result would be stamped "
+                    "'dora' and reload the plain-LoRA modules as DoRA. "
+                    "Reload the base model before requesting DoRA, or train "
+                    "with use_dora=False."
                 )
             # A mixed tree is not rejected by the savers -- it saves, is
             # stamped "dora", and reloads as all-DoRA -- so refuse it here.

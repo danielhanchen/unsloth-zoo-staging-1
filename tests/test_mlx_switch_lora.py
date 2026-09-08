@@ -708,6 +708,72 @@ def test_dora_validation_mirrors_the_per_layer_selection():
     assert type(root.proj).__name__ == "FusedLinear"
 
 
+def test_dora_refuses_quantized_widths_its_wrapper_cannot_unpack():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.loader import _mlx_dora_wrapper_type
+
+    _require_real_mlx_wrappers()
+
+    # DoRALinear.from_base recovers the unpacked width as `32 // bits`, which
+    # is exact only for widths dividing 32. At 3/5/6 it truncates and the
+    # wrapper raises a bare matmul shape error on its first forward, so the
+    # dispatch has to refuse rather than hand one back. Plain LoRA is fine at
+    # those widths, which is why this cannot be left to the base type alone.
+    for bits in (2, 4, 8):
+        base = nn.QuantizedLinear(64, 16, bias=False, bits=bits, group_size=64)
+        wrapper = _mlx_dora_wrapper_type(base, "proj").from_base(
+            base, r=4, scale=2.0, dropout=0.0,
+        )
+        out = wrapper(mx.ones((1, 64)))
+        mx.eval(out)
+        assert out.shape == (1, 16)
+
+    for bits in (3, 5, 6):
+        base = nn.QuantizedLinear(64, 16, bias=False, bits=bits, group_size=64)
+        with pytest.raises(ValueError, match=f"{bits}-bit"):
+            _mlx_dora_wrapper_type(base, "proj")
+
+    # A dense base carries no `bits`, so the width gate must not touch it.
+    assert _mlx_dora_wrapper_type(
+        nn.Linear(64, 16, bias=False), "proj",
+    ).__name__ == "DoRALinear"
+
+
+def test_dora_refuses_a_tree_that_already_carries_plain_lora():
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    _require_real_mlx_wrappers()
+
+    # Adapter modules left outside the DoRA selection survive the wrap, and
+    # the artifact records one type for the whole tree, so the mixed result
+    # would be stamped "dora" and reload those layers as a wrapper they were
+    # never trained as.
+    model = _TinyModel([
+        nn.Linear(64, 16, bias=False), nn.Linear(64, 16, bias=False),
+    ])
+    model.model.layers[1].proj = LoRALinear.from_base(
+        model.model.layers[1].proj, r=4, scale=2.0, dropout=0.0,
+    )
+    with pytest.raises(ValueError, match="already carries"):
+        FastMLXModel.get_peft_model(
+            model, r=4, target_modules=["proj"], use_dora=True,
+            use_gradient_checkpointing=False, finetune_last_n_layers=1,
+        )
+    assert type(model.model.layers[0].proj).__name__ == "Linear"
+    assert type(model.model.layers[1].proj).__name__ == "LoRALinear"
+
+    # The gate is about MIXING, so a clean base is untouched by it.
+    clean = _TinyModel([nn.Linear(64, 16, bias=False)])
+    FastMLXModel.get_peft_model(
+        clean, r=4, target_modules=["proj"], use_dora=True,
+        use_gradient_checkpointing=False,
+    )
+    assert type(clean.model.layers[0].proj).__name__ == "DoRALinear"
+
+
 def test_dora_request_refusals_and_positional_compatibility():
     import mlx.nn as nn
     from unsloth_zoo.mlx.loader import FastMLXModel
