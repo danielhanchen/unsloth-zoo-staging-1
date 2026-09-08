@@ -4407,6 +4407,64 @@ def test_mlx_lm_tokenizer_loader_forwards_trust(monkeypatch, tmp_path, trust):
     assert calls[0]["trust_remote_code"] is trust
 
 
+def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path):
+    """gpt2 and friends declare no tokenizer_class and ship no
+    special_tokens_map.json: bos/eos/unk come from the tokenizer class's
+    __init__ defaults. Loading the bare backend drops them, and an eos_token of
+    None leaves mlx-lm generation with no stop token."""
+    import json
+    import transformers
+    import unsloth_zoo.mlx.loader as loader
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2")
+    tokenizer.save_pretrained(tmp_path)
+    # save_pretrained writes a tokenizer_class the published repo does not have.
+    config_path = tmp_path / "tokenizer_config.json"
+    metadata = json.loads(config_path.read_text())
+    metadata.pop("tokenizer_class", None)
+    config_path.write_text(json.dumps(metadata))
+    (tmp_path / "special_tokens_map.json").unlink(missing_ok=True)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "gpt2"}))
+
+    loaded = loader._load_mlx_tokenizer(tmp_path)
+    assert loaded.eos_token == tokenizer.eos_token
+    assert loaded.eos_token_id == tokenizer.eos_token_id
+    assert loaded.bos_token == tokenizer.bos_token
+    assert loaded("hello world")["input_ids"] == tokenizer("hello world")["input_ids"]
+
+
+def test_model_type_lookup_never_builds_a_model_config(monkeypatch, tmp_path):
+    """The recovery above must not reintroduce the validation this PR removes."""
+    import json
+    import transformers
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "gpt2"}))
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained",
+        staticmethod(lambda *a, **k: pytest.fail("model config must not be resolved")),
+    )
+    assert loader._tokenizer_class_for_model_type(tmp_path) is not None
+
+
+@pytest.mark.parametrize("bad", [
+    {},                                  # no model_type at all
+    {"model_type": "not_a_real_model"},  # unknown to transformers
+])
+def test_model_type_lookup_returns_none_when_unresolvable(tmp_path, bad):
+    import json
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "config.json").write_text(json.dumps(bad))
+    assert loader._tokenizer_class_for_model_type(tmp_path) is None
+
+
+def test_model_type_lookup_tolerates_missing_config(tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    assert loader._tokenizer_class_for_model_type(tmp_path) is None
+
+
 @pytest.mark.parametrize("trust", [False, True])
 def test_image_processor_builder_forwards_trust(monkeypatch, tmp_path, trust):
     import transformers
@@ -4414,12 +4472,37 @@ def test_image_processor_builder_forwards_trust(monkeypatch, tmp_path, trust):
 
     processor, calls = object(), []
 
-    def from_pretrained(path, **kwargs):
+    def record(path, **kwargs):
         calls.append(kwargs["trust_remote_code"])
         return processor
 
-    monkeypatch.setattr(transformers.AutoImageProcessor, "from_pretrained", staticmethod(from_pretrained))
+    class FakeAutoImageProcessor:
+        from_pretrained = staticmethod(record)
+
+    # Replace the NAME the builder imports, never an attribute OF the real class:
+    # without torchvision, transformers 5.x hands out AutoImageProcessor as a
+    # backend-gated placeholder that raises ImportError on every attribute read,
+    # and setattr reads the old value first. torchvision is not a dependency of
+    # this package, so that is the configuration the MLX path runs in.
+    monkeypatch.setattr(transformers, "AutoImageProcessor", FakeAutoImageProcessor)
     assert loader._build_vlm_image_processor_from_config(
         tmp_path, {}, {}, trust_remote_code=trust,
     ) is processor
     assert calls == [trust]
+
+
+def test_image_processor_builder_degrades_when_backend_is_gated(monkeypatch, tmp_path):
+    """The caller treats None as "no image processor", so a gated
+    AutoImageProcessor has to degrade instead of raising out of the loader."""
+    import transformers
+    import unsloth_zoo.mlx.loader as loader
+
+    class GatedAutoImageProcessor:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            raise ImportError("requires the Torchvision library")
+
+    monkeypatch.setattr(transformers, "AutoImageProcessor", GatedAutoImageProcessor)
+    assert loader._build_vlm_image_processor_from_config(
+        tmp_path, {}, {}, trust_remote_code=False,
+    ) is None

@@ -832,6 +832,30 @@ def _raise_mlx_remote_code_refusal(model_path, error, *, tokenizer_only=False):
             ) from error
 
 
+def _tokenizer_class_for_model_type(model_path):
+    """Resolve the tokenizer class from config.json's model_type STRING.
+
+    gpt2 and its relatives declare no tokenizer_class and ship no
+    special_tokens_map.json: their bos/eos/unk live in the tokenizer class's
+    __init__ defaults, so loading the bare backend silently drops them and
+    eos_token becomes None. The model_type is read as plain JSON and never
+    instantiated, so no model config validator runs.
+    """
+    from transformers.models.auto.tokenization_auto import (
+        TOKENIZER_MAPPING_NAMES, tokenizer_class_from_name,
+    )
+
+    model_type = _read_json_file(
+        os.path.join(str(model_path), "config.json"),
+    ).get("model_type")
+    if not model_type:
+        return None
+    mapped = TOKENIZER_MAPPING_NAMES.get(model_type)
+    if isinstance(mapped, (list, tuple)):
+        mapped = next((item for item in reversed(mapped) if item), None)
+    return tokenizer_class_from_name(mapped) if mapped else None
+
+
 def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
     from transformers.models.auto.tokenization_auto import (
@@ -848,6 +872,8 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
         tokenizer_class = tokenizer_class_from_name(class_name.removesuffix("Fast") + "Fast")
         if tokenizer_class is None:
             tokenizer_class = tokenizer_class_from_name(class_name)
+    if tokenizer_class is None and not remote:
+        tokenizer_class = _tokenizer_class_for_model_type(model_path)
     has_fast_file = (Path(model_path) / "tokenizer.json").is_file()
     if has_fast_file and (
         not remote or "tiktoken" in (str(class_name) + str(remote)).lower()
