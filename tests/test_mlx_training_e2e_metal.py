@@ -1219,7 +1219,8 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
     feeds a model call to cross-entropy has to accept both."""
     import mlx.core as mx
 
-    from unsloth_zoo.mlx.preference import make_dpo_loss_fn, make_orpo_loss_fn
+    from unsloth_zoo.mlx.preference import (
+        make_dpo_loss_fn, make_orpo_loss_fn, resolve_preference_objective)
     from unsloth_zoo.mlx.utils import make_baseline_loss_fn
 
     vocab = 8
@@ -1239,8 +1240,9 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
         return _LanguageModelOutput(logits)
 
     baseline = make_baseline_loss_fn()
-    orpo = make_orpo_loss_fn(beta=0.1)
-    dpo = make_dpo_loss_fn(beta=0.1, reference_free=True)
+    orpo = make_orpo_loss_fn(resolve_preference_objective("orpo", beta=0.1))
+    dpo = make_dpo_loss_fn(resolve_preference_objective(
+        "dpo", beta=0.1, reference_free=True))
     # Chosen and rejected rows differ, so an unwrap that reordered the batch
     # axis would reverse the preference signal instead of comparing equal.
     rejected_ids = mx.array([[1, 5, 6, 7]], dtype=mx.int32)
@@ -1440,3 +1442,15 @@ def test_gather_qmm_guard_never_breaks_a_working_call(failing, monkeypatch,
         **kw) == "result"
     assert seen["sorted_indices"] is True
     assert mlx_utils._MLX_GATHER_QMM_UNREADABLE is True   # warns once, not per call
+
+
+@metal_only
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
+def test_the_logit_sum_holds_the_widest_vocabulary_in_float16(dtype):
+    """float16 stops at 65504, far below the 1e9 a wide row of logits sums to."""
+    from unsloth_zoo.mlx.preference import _row_logit_sum
+
+    wide = mx.full((1, 2, 262144), 4000.0, dtype=getattr(mx, dtype))
+    rows = _row_logit_sum(wide)
+    assert bool(mx.all(mx.isfinite(rows))), "the scale does not cover 256K"
+    assert float(rows[0, 0]) == pytest.approx(262144 * 4000.0, rel=1e-3)
