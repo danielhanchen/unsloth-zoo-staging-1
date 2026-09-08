@@ -179,6 +179,27 @@ def test_down_lora_grads_match_reference(monkeypatch):
     torch.testing.assert_close(second.grad, second_ref.grad, rtol=1e-4, atol=1e-4)
 
 
+def test_down_lora_promotes_a_wider_scaling_tensor(monkeypatch):
+    """A non-0-dim `scaling` tensor in a wider dtype must not break the scatter.
+
+    ``lora_delta * scaling`` promotes when ``scaling`` is a tensor with at least one
+    dimension, so the delta can arrive wider than the GEMM output. The plain add this
+    replaced promoted silently; ``index_add_`` would raise on the dtype mismatch, so
+    the scatter has to promote too. A 0-dim tensor does not promote and is covered by
+    the float case above.
+    """
+    experts, first, second, _, X, top_k_index, top_k_weights = _setup(monkeypatch)
+
+    experts._unsloth_lora_down_proj = (first, second, 0.5)
+    baseline = forward_triton_grouped_gemm(experts, X, top_k_index, top_k_weights)
+
+    experts._unsloth_lora_down_proj = (first, second, torch.tensor([0.5], dtype=torch.float64))
+    promoted = forward_triton_grouped_gemm(experts, X, top_k_index, top_k_weights)
+
+    assert promoted.dtype == torch.float64
+    torch.testing.assert_close(promoted.float(), baseline, rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_down_lora_matches_reference_on_real_kernels():
     """Same check on the real Triton grouped GEMM, bf16, on the GPU.

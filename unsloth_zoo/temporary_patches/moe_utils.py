@@ -2082,7 +2082,16 @@ def forward_triton_grouped_gemm(
 
         # The second GEMM ran permute_y=True, so second_gemm_output is back in token
         # order while lora_delta is still expert-sorted. Scatter it to match.
-        second_gemm_output.index_add_(0, gather_indices, lora_delta)
+        if lora_delta.dtype == second_gemm_output.dtype:
+            second_gemm_output.index_add_(0, gather_indices, lora_delta)
+        else:
+            # index_add_ requires both operands to share a dtype, but the plain add
+            # this replaces promoted instead. A non-0-dim `scaling` tensor in a wider
+            # dtype hits exactly that, so keep promoting rather than raising.
+            promoted = torch.promote_types(second_gemm_output.dtype, lora_delta.dtype)
+            second_gemm_output = second_gemm_output.to(promoted).index_add(
+                0, gather_indices, lora_delta.to(promoted)
+            )
 
     # Apply routing weights and sum across top_k: (num_tokens, top_k, hidden) -> (num_tokens, hidden).
     top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
