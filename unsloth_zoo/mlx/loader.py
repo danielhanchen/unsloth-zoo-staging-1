@@ -861,6 +861,116 @@ def _materialize_mlx_vlm_config_override(
     return override_dir, patched_config
 
 
+_TOKENIZER_LOAD_LOCK = threading.RLock()
+_TOKENIZER_LOAD_STATE = threading.local()
+
+
+def _remote_code_reference(metadata, auto_class):
+    auto_map = metadata.get("auto_map", {})
+    reference = auto_map.get(auto_class) if isinstance(auto_map, dict) else (
+        auto_map if auto_class == "AutoTokenizer" else None
+    )
+    if isinstance(reference, (list, tuple)):
+        reference = next((item for item in reversed(reference) if item), None)
+    return reference if isinstance(reference, str) else None
+
+
+def _tokenizer_class_for_model_type(model_path):
+    """Resolve the tokenizer class from config.json's model_type STRING.
+
+    gpt2 and its relatives declare no tokenizer_class and ship no
+    special_tokens_map.json: their bos/eos/unk live in the tokenizer class's
+    __init__ defaults, so loading the bare backend silently drops them and
+    eos_token becomes None. The model_type is read as plain JSON and never
+    instantiated, so no model config validator runs.
+    """
+    from transformers.models.auto.tokenization_auto import (
+        TOKENIZER_MAPPING_NAMES, tokenizer_class_from_name,
+    )
+
+    model_type = _read_json_file(
+        os.path.join(str(model_path), "config.json"),
+    ).get("model_type")
+    if not model_type:
+        return None
+    mapped = TOKENIZER_MAPPING_NAMES.get(model_type)
+    if isinstance(mapped, (list, tuple)):
+        mapped = next((item for item in reversed(mapped) if item), None)
+    return tokenizer_class_from_name(mapped) if mapped else None
+
+
+def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
+    """Load a tokenizer without letting AutoTokenizer resolve the model config.
+
+    transformers 5.x resolves the model config before tokenization and only
+    catches ValueError/OSError from it, so published configs that raise
+    AttributeError or KeyError (Phi-4 multimodal, Nemotron NAS/H, DeepSeek
+    V3.2, MiniCPM3) take an otherwise loadable tokenizer down with them.
+    """
+    from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+    from transformers.models.auto.tokenization_auto import (
+        get_tokenizer_config, tokenizer_class_from_name,
+    )
+
+    auto_loader = _auto_loader or AutoTokenizer.from_pretrained
+    # None != False here: transformers answers a missing trust_remote_code by
+    # prompting on stdin, and the blank config below forces has_local_code
+    # False, so a remote-code repo blocks ~15s on a question nobody asked.
+    kwargs.setdefault("trust_remote_code", False)
+    metadata = get_tokenizer_config(model_path, **kwargs)
+    class_name = metadata.get("tokenizer_class")
+    remote = _remote_code_reference(metadata, "AutoTokenizer")
+    tokenizer_class = None
+    if class_name:
+        tokenizer_class = tokenizer_class_from_name(class_name.removesuffix("Fast") + "Fast")
+        if tokenizer_class is None:
+            tokenizer_class = tokenizer_class_from_name(class_name)
+    if tokenizer_class is None and not remote:
+        tokenizer_class = _tokenizer_class_for_model_type(model_path)
+    if not remote and (Path(model_path) / "tokenizer.json").is_file():
+        if tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
+            tokenizer_class = PreTrainedTokenizerFast
+        return tokenizer_class.from_pretrained(model_path, *args, **kwargs)
+    # Tokenizer metadata selects the class; model validators have no role here.
+    if class_name or remote:
+        kwargs["config"] = PretrainedConfig()
+    return auto_loader(model_path, *args, **kwargs)
+
+
+@contextmanager
+def _mlx_tokenizer_loading_scope():
+    """Route mlx-lm's internal AutoTokenizer call through _load_mlx_tokenizer.
+
+    mlx_lm.utils.load_tokenizer calls AutoTokenizer.from_pretrained directly, so
+    the only way to reach it is to patch the class. The active flag is
+    thread-local, so other threads keep ordinary behaviour, and the lock keeps
+    two scopes from capturing each other's patch as the original.
+    """
+    from transformers import AutoTokenizer
+
+    with _TOKENIZER_LOAD_LOCK:
+        original_descriptor = AutoTokenizer.__dict__["from_pretrained"]
+        original = getattr(_TOKENIZER_LOAD_STATE, "original", AutoTokenizer.from_pretrained)
+        previous = getattr(_TOKENIZER_LOAD_STATE, "active", False)
+        _TOKENIZER_LOAD_STATE.active = True
+        _TOKENIZER_LOAD_STATE.original = original
+
+        @classmethod
+        def load(cls, model_path, *args, **kwargs):
+            if not getattr(_TOKENIZER_LOAD_STATE, "active", False):
+                return original(model_path, *args, **kwargs)
+            return _load_mlx_tokenizer(model_path, *args, _auto_loader=original, **kwargs)
+
+        AutoTokenizer.from_pretrained = load
+        try:
+            yield
+        finally:
+            AutoTokenizer.from_pretrained = original_descriptor
+            _TOKENIZER_LOAD_STATE.active = previous
+            if not previous:
+                del _TOKENIZER_LOAD_STATE.original
+
+
 def _load_mlx_lm_with_strict_fallback(
     model_name,
     model_type,
@@ -909,11 +1019,12 @@ def _load_mlx_lm_with_strict_fallback(
             model_config=model_config,
         )
 
-    tokenizer = load_tokenizer(
-        model_path,
-        tokenizer_config,
-        eos_token_ids=config.get("eos_token_id", None),
-    )
+    with _mlx_tokenizer_loading_scope():
+        tokenizer = load_tokenizer(
+            model_path,
+            tokenizer_config,
+            eos_token_ids=config.get("eos_token_id", None),
+        )
     if want_config:
         return model, tokenizer, config
     return model, tokenizer
@@ -1105,11 +1216,12 @@ def _load_mlx_lm_distributed(
         cleanup_final_model_path = True
 
         try:
-            tokenizer = load_tokenizer(
-                final_model_path,
-                tokenizer_config,
-                eos_token_ids=config.get("eos_token_id", None),
-            )
+            with _mlx_tokenizer_loading_scope():
+                tokenizer = load_tokenizer(
+                    final_model_path,
+                    tokenizer_config,
+                    eos_token_ids=config.get("eos_token_id", None),
+                )
             model, _config = load_model(
                 final_model_path,
                 lazy=True,
@@ -1847,11 +1959,10 @@ def _repair_degraded_vlm_processor(
     tokenizer = getattr(processor, "tokenizer", None) or processor
     if tokenizer is None or not hasattr(tokenizer, "save_pretrained"):
         try:
-            from transformers import AutoTokenizer
             tokenizer_kwargs = {"trust_remote_code": trust_remote_code}
             if token:
                 tokenizer_kwargs["token"] = token
-            tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
+            tokenizer = _load_mlx_tokenizer(model_path, **tokenizer_kwargs)
         except Exception:
             return processor
 
@@ -5141,7 +5252,7 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
     with _BNB_IMPORT_LOCK, _lifted_bitsandbytes_stub():
         import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM
 
         device = "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -5185,7 +5296,7 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
                 pass
             model.save_pretrained(tmpdir, safe_serialization=True)
             # Needed by the downstream mlx-lm load.
-            AutoTokenizer.from_pretrained(
+            _load_mlx_tokenizer(
                 source, token=token, trust_remote_code=trust_remote_code,
             ).save_pretrained(tmpdir)
         except BaseException:
