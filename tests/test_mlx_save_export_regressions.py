@@ -4353,7 +4353,6 @@ def test_tokenizer_scope_routes_mlx_lm_and_restores(tmp_path):
         pass
     assert AutoTokenizer.__dict__["from_pretrained"] is pristine
 
-    # Nested scopes restore only at the outermost exit.
     with loader._mlx_tokenizer_loading_scope():
         with loader._mlx_tokenizer_loading_scope():
             pass
