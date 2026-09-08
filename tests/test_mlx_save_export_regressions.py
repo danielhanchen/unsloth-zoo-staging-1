@@ -4272,24 +4272,32 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
     special_tokens_map.json: bos/eos/unk come from the tokenizer class's
     __init__ defaults. Loading the bare backend drops them, and an eos_token of
     None leaves mlx-lm generation with no stop token."""
-    import transformers
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
     import unsloth_zoo.mlx.loader as loader
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2")
-    tokenizer.save_pretrained(tmp_path)
-    # save_pretrained writes a tokenizer_class the published repo does not have.
-    config_path = tmp_path / "tokenizer_config.json"
-    metadata = json.loads(config_path.read_text())
-    metadata.pop("tokenizer_class", None)
-    config_path.write_text(json.dumps(metadata))
-    (tmp_path / "special_tokens_map.json").unlink(missing_ok=True)
+    # The published gpt2 repo's shape, built locally: a serialized fast
+    # tokenizer, no tokenizer_class, no special_tokens_map.json. Downloading the
+    # real one would make this fail offline or behind a proxy, and this file is
+    # a hard gate in the Repo tests (CPU) lane.
+    vocab = {"<|endoftext|>": 0, "hello": 1, "Ġworld": 2}
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"model_max_length": 1024}))
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "gpt2"}))
 
+    # The bare backend is what the fast-file branch used to return, and it has
+    # no defaults to fall back on.
+    bare = PreTrainedTokenizerFast.from_pretrained(tmp_path)
+    assert bare.eos_token is None
+
     loaded = loader._load_mlx_tokenizer(tmp_path)
-    assert loaded.eos_token == tokenizer.eos_token
-    assert loaded.eos_token_id == tokenizer.eos_token_id
-    assert loaded.bos_token == tokenizer.bos_token
-    assert loaded("hello world")["input_ids"] == tokenizer("hello world")["input_ids"]
+    assert loaded.eos_token == "<|endoftext|>"
+    assert loaded.bos_token == "<|endoftext|>"
+    assert loaded.eos_token_id == 0
+    assert loaded("hello world")["input_ids"] == bare("hello world")["input_ids"]
 
 
 def test_model_type_lookup_never_builds_a_model_config(monkeypatch, tmp_path):
