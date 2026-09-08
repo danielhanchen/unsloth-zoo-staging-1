@@ -664,6 +664,50 @@ def test_dora_refuses_fused_and_routed_bases_atomically():
     assert type(head.model.layers[0].proj).__name__ == "Linear"
 
 
+def test_dora_validation_mirrors_the_per_layer_selection():
+    import mlx.nn as nn
+    from mlx_lm.models.afm7 import FusedLinear
+    from unsloth_zoo.mlx.loader import linear_to_lora_layers
+
+    _require_real_mlx_wrappers()
+
+    config = {"rank": 4, "alpha": 8, "dropout": 0.0, "scale": 2.0,
+              "use_dora": True, "keys": {"proj"}}
+
+    # Role-based selection makes `keys` a union that is not layer-wide: the
+    # same local name can be a selected dense projection in one layer and an
+    # unselected fused one in another. Validating the union would refuse the
+    # run over a module the conversion never touches.
+    model = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
+    attached = linear_to_lora_layers(
+        model, num_layers=2,
+        config={**config, "layer_keys": [["proj"], []]},
+    )
+    assert attached == 1
+    assert type(model.model.layers[0].proj).__name__ == "DoRALinear"
+    assert type(model.model.layers[1].proj).__name__ == "FusedLinear"
+
+    # Selected, it is still refused, and still before anything is committed.
+    selected = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
+    with pytest.raises(ValueError, match="FusedLinear"):
+        linear_to_lora_layers(
+            selected, num_layers=2,
+            config={**config, "layer_keys": [["proj"], ["proj"]]},
+        )
+    assert type(selected.model.layers[0].proj).__name__ == "Linear"
+
+    # The root pass walks `shared`, so a layer-local name that also names a
+    # root module is not validated there either.
+    root = _TinyModel([nn.Linear(64, 16, bias=False)])
+    root.proj = FusedLinear(64, [8, 8])
+    attached = linear_to_lora_layers(
+        root, num_layers=1, config={**config, "layer_keys": [["proj"]]},
+    )
+    assert attached == 1
+    assert type(root.model.layers[0].proj).__name__ == "DoRALinear"
+    assert type(root.proj).__name__ == "FusedLinear"
+
+
 def test_dora_request_refusals_and_positional_compatibility():
     import mlx.nn as nn
     from unsloth_zoo.mlx.loader import FastMLXModel

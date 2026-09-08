@@ -362,22 +362,33 @@ def linear_to_lora_layers(model, num_layers, config):
     shared = keys - {k for ks in layer_keys for k in ks} if layer_keys else keys
 
     limit = max(int(num_layers), 0)
+    offset = max(len(layers) - limit, 0)
+
+    def _layer_wanted(index):
+        return (set(layer_keys[index]) | shared) if layer_keys else keys
+
     if config.get("use_dora"):
         # Wrappers are committed per layer below, so an unsupported base
         # found late would leave earlier layers converted and the retry
         # advice (use_dora=False) failing on them. Only the TYPE refusal is
         # all-or-nothing; a later construction failure is not covered.
-        for layer in layers[max(len(layers) - limit, 0):]:
+        #
+        # Same predicates as the conversion, not the `keys` union: under
+        # role-based selection a local name can be a selected dense
+        # projection in one layer and an unselected fused or routed one in
+        # another, and validating the union would refuse the run over a
+        # module that is never wrapped.
+        for index, layer in enumerate(layers[offset:], start=offset):
+            wanted = _layer_wanted(index)
             for name, module in layer.named_modules():
-                if name in keys:
+                if name in wanted:
                     _mlx_dora_wrapper_type(module, name)
         for name, module in model.named_modules():
-            if name in keys:
+            if name in shared:
                 _mlx_dora_wrapper_type(module, name)
     attached = 0
-    offset = max(len(layers) - limit, 0)
     for index, layer in enumerate(layers[offset:], start=offset):
-        wanted = (set(layer_keys[index]) | shared) if layer_keys else keys
+        wanted = _layer_wanted(index)
         replacements = []
         for name, module in layer.named_modules():
             if name not in wanted:
