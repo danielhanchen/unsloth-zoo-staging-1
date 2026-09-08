@@ -4276,10 +4276,8 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
     from transformers import PreTrainedTokenizerFast
     import unsloth_zoo.mlx.loader as loader
 
-    # The published gpt2 repo's shape, built locally: a serialized fast
-    # tokenizer, no tokenizer_class, no special_tokens_map.json. Downloading the
-    # real one would make this fail offline or behind a proxy, and this file is
-    # a hard gate in the Repo tests (CPU) lane.
+    # gpt2's published shape, built locally: downloading it fails offline, and
+    # this file is a hard gate in the Repo tests (CPU) lane.
     vocab = {"<|endoftext|>": 0, "hello": 1, "Ġworld": 2}
     backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
     backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -4288,8 +4286,7 @@ def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path)
     (tmp_path / "tokenizer_config.json").write_text(json.dumps({"model_max_length": 1024}))
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "gpt2"}))
 
-    # The bare backend is what the fast-file branch used to return, and it has
-    # no defaults to fall back on.
+    # What the fast-file branch used to return: no class defaults to fall back on.
     bare = PreTrainedTokenizerFast.from_pretrained(tmp_path)
     assert bare.eos_token is None
 
@@ -4397,9 +4394,8 @@ def test_tokenizer_load_never_prompts_for_remote_code(monkeypatch, tmp_path):
     }))
     (tmp_path / "tokenization_custom.py").write_text("class RemoteTokenizer: pass\n")
 
-    # Record rather than raise: resolve_trust_remote_code wraps the prompt in
-    # `except Exception` and rewrites anything raised here into the same
-    # ValueError the passing path produces, which hides the prompt entirely.
+    # Record, never raise: resolve_trust_remote_code catches Exception and
+    # rewrites it into the ValueError the passing path also produces.
     prompts = []
 
     def fake_input(*args, **kwargs):
