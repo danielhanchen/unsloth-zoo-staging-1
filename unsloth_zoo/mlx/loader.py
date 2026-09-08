@@ -275,7 +275,68 @@ def _mlx_lora_spec_for_module(module, specs):
     return None
 
 
-def _mlx_lora_from_base(module, config, *, specs):
+def _unfreeze_dora_magnitudes(model):
+    from .utils import iter_mlx_lora_modules
+
+    count = 0
+    # LoRA pair AND DoRA class, like the adapter collector: a base module
+    # that merely owns an `m` must stay frozen.
+    for _name, module in iter_mlx_lora_modules(model):
+        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
+            module.unfreeze(keys=["m"], recurse=False)
+            count += 1
+    return count
+
+
+def _mlx_dora_wrapper_type(module, path):
+    import mlx.nn as nn
+
+    try:
+        from mlx_lm.tuner.dora import DoRALinear
+    except ImportError as exc:
+        raise ImportError(
+            "Unsloth MLX: DoRA training needs mlx_lm.tuner.dora.DoRALinear; "
+            "upgrade mlx-lm or train with use_dora=False."
+        ) from exc
+    # Exact types, not isinstance: a fused projection subclasses nn.Linear
+    # but returns a tuple its caller destructures, so a wrapper returning one
+    # array attaches cleanly and then breaks the next forward.
+    if type(module) in (nn.Linear, nn.QuantizedLinear):
+        # DoRALinear.from_base recovers the unpacked width as
+        # `input_dims *= 32 // linear.bits`, which is exact only when bits
+        # divides 32. At 3, 5 or 6 it truncates, so lora_a is built against
+        # the wrong input dimension and the wrapper raises a bare matmul
+        # shape error on its first forward. Plain LoRA is unaffected, so
+        # refuse here rather than hand back a wrapper that cannot run.
+        bits = getattr(module, "bits", None)
+        if bits is not None and 32 % int(bits):
+            raise ValueError(
+                f"Unsloth MLX: DoRA cannot wrap {path or type(module).__name__} "
+                f"({int(bits)}-bit quantized); mlx-lm's DoRA wrapper only "
+                "recovers the unpacked width for bit widths that divide 32 "
+                "(2, 4, 8), and builds an unusable wrapper otherwise. "
+                "Requantize the base at 4 or 8 bits, or train with "
+                "use_dora=False."
+            )
+        return DoRALinear
+    raise ValueError(
+        f"Unsloth MLX: DoRA cannot wrap {path or type(module).__name__} "
+        f"({type(module).__name__}); MLX DoRA training covers plain "
+        "Linear/QuantizedLinear bases only, so fused projections and routed "
+        "experts are unsupported. Deselect it, or train with use_dora=False."
+    )
+
+
+def _mlx_lora_from_base(module, config, *, specs, path=None):
+    if config.get("use_dora"):
+        # to_lora() returns plain-LoRA wrappers for fused linears, which
+        # would silently downgrade the request; mlx-lm skips it for that too.
+        return _mlx_dora_wrapper_type(module, path).from_base(
+            module,
+            r=config["rank"],
+            scale=config["scale"],
+            dropout=config["dropout"],
+        )
     if callable(getattr(module, "to_lora", None)):
         return module.to_lora(
             r=config["rank"],
@@ -317,10 +378,33 @@ def linear_to_lora_layers(model, num_layers, config):
     shared = keys - {k for ks in layer_keys for k in ks} if layer_keys else keys
 
     limit = max(int(num_layers), 0)
-    attached = 0
     offset = max(len(layers) - limit, 0)
+
+    def _layer_wanted(index):
+        return (set(layer_keys[index]) | shared) if layer_keys else keys
+
+    if config.get("use_dora"):
+        # Wrappers are committed per layer below, so an unsupported base
+        # found late would leave earlier layers converted and the retry
+        # advice (use_dora=False) failing on them. Only the TYPE refusal is
+        # all-or-nothing; a later construction failure is not covered.
+        #
+        # Same predicates as the conversion, not the `keys` union: under
+        # role-based selection a local name can be a selected dense
+        # projection in one layer and an unselected fused or routed one in
+        # another, and validating the union would refuse the run over a
+        # module that is never wrapped.
+        for index, layer in enumerate(layers[offset:], start=offset):
+            wanted = _layer_wanted(index)
+            for name, module in layer.named_modules():
+                if name in wanted:
+                    _mlx_dora_wrapper_type(module, name)
+        for name, module in model.named_modules():
+            if name in shared:
+                _mlx_dora_wrapper_type(module, name)
+    attached = 0
     for index, layer in enumerate(layers[offset:], start=offset):
-        wanted = (set(layer_keys[index]) | shared) if layer_keys else keys
+        wanted = _layer_wanted(index)
         replacements = []
         for name, module in layer.named_modules():
             if name not in wanted:
@@ -331,6 +415,7 @@ def linear_to_lora_layers(model, num_layers, config):
                     module,
                     config,
                     specs=type_specs,
+                    path=name,
                 ),
             ))
         if replacements:
@@ -341,7 +426,7 @@ def linear_to_lora_layers(model, num_layers, config):
     # layer walk above never reaches it.
     # `shared`, not `keys`: a layer-local `ff_proj` can name a root module too.
     root_replacements = [
-        (name, _mlx_lora_from_base(module, config, specs=type_specs))
+        (name, _mlx_lora_from_base(module, config, specs=type_specs, path=name))
         for name, module in model.named_modules()
         if name in shared
     ]
@@ -8641,6 +8726,9 @@ class FastMLXModel:
         finetune_mlp_modules=True,
         finetune_last_n_layers=None,
         modules_to_save=None,
+        # Appended, never inserted: pre-DoRA positional callers must keep
+        # binding the same arguments.
+        use_dora=False,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Apply LoRA via mlx-lm on Apple Silicon.
@@ -8666,6 +8754,8 @@ class FastMLXModel:
             )
         if type(use_rslora) is not bool:
             raise TypeError("Unsloth: use_rslora must be True or False.")
+        if type(use_dora) is not bool:
+            raise TypeError("Unsloth: use_dora must be True or False.")
         _validate_mlx_init_lora_weights(init_lora_weights)
 
         if getattr(model, "_unsloth_full_finetuning", False):
@@ -8777,9 +8867,66 @@ class FastMLXModel:
             "alpha": lora_alpha,
             "dropout": lora_dropout,
             "scale": lora_alpha / (math.sqrt(r) if use_rslora else r),
+            "use_dora": bool(use_dora),
         }
 
         is_vlm = getattr(model, "_is_vlm_model", False)
+
+        if use_dora:
+            if lora_dropout:
+                # Reported rather than refused: an interchange caveat must
+                # not block a run that trains correctly here.
+                print(
+                    "Unsloth: DoRA with lora_dropout > 0 trains normally in "
+                    "MLX format, but peft applies DoRA dropout inside the "
+                    "magnitude correction while mlx-lm leaves the base "
+                    "undropped, so continuing this adapter under peft would "
+                    "not reproduce the same training. Use lora_dropout=0 to "
+                    "keep the two equivalent."
+                )
+            if init_lora_weights is False:
+                # `m` is seeded from the base weight norm, which is the
+                # adapted norm only while lora_b is zero; re-deriving it for
+                # randomized factors is init math left to mlx-lm.
+                raise ValueError(
+                    "Unsloth MLX: DoRA does not support "
+                    "init_lora_weights=False; the magnitude vector is "
+                    "seeded from the base weight and would not match the "
+                    "randomized adapter. Use init_lora_weights=True (or "
+                    "'gaussian'), or train with use_dora=False."
+                )
+            # Same reason as the vision refusal below, but about the tree
+            # rather than the request: a base that already carries plain-LoRA
+            # wrappers outside this selection (a previously adapted vision
+            # tower, a resumed adapter) keeps them, and the saved artifact
+            # still records one adapter type for the whole tree.
+            from .utils import iter_mlx_lora_modules
+
+            existing = sorted({
+                type(module).__name__
+                for _name, module in iter_mlx_lora_modules(model)
+                if not type(module).__name__.startswith("DoRA")
+            })
+            if existing:
+                raise ValueError(
+                    "Unsloth MLX: DoRA cannot be added to a model that "
+                    f"already carries {', '.join(existing)} adapter "
+                    "modules; the saved adapter records a single type for "
+                    "the whole tree, so the mixed result would be stamped "
+                    "'dora' and reload the plain-LoRA modules as DoRA. "
+                    "Reload the base model before requesting DoRA, or train "
+                    "with use_dora=False."
+                )
+            # A mixed tree is not rejected by the savers -- it saves, is
+            # stamped "dora", and reloads as all-DoRA -- so refuse it here.
+            if is_vlm and (train_vision or train_projector):
+                raise ValueError(
+                    "Unsloth MLX: DoRA is not supported for vision or "
+                    "projector towers; those wrap as plain LoRA, and the "
+                    "saved adapter records a single adapter type for the "
+                    "whole tree, so the mixed result reloads as all-DoRA. "
+                    "Train the language tower only, or use use_dora=False."
+                )
 
         if is_vlm:
             # Decide, and refuse, before anything is modified.
@@ -8873,6 +9020,8 @@ class FastMLXModel:
                 _raise_no_lora_targets(target_modules)
 
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+            if use_dora:
+                _unfreeze_dora_magnitudes(model)
             _unfreeze_full_modules(_cpt_full_specs)
         else:
             # No tower to adapt, and nothing to name in an error either.
@@ -8953,6 +9102,8 @@ class FastMLXModel:
 
             model.freeze()
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+            if use_dora:
+                _unfreeze_dora_magnitudes(model)
             # CPT full modules train at load dtype, scaled by embedding_learning_rate.
             _unfreeze_full_modules(_cpt_full_specs)
 
