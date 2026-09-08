@@ -4373,3 +4373,32 @@ def test_tokenizer_scope_routes_mlx_lm_and_restores(tmp_path):
         thread.join(timeout=60)
     assert not errors
     assert AutoTokenizer.__dict__["from_pretrained"] is pristine
+
+
+def test_tokenizer_load_never_prompts_for_remote_code(monkeypatch, tmp_path):
+    """transformers reads a missing trust_remote_code as None, and answers None
+    by prompting on stdin for TIME_OUT_REMOTE_CODE seconds. The blank config
+    _load_mlx_tokenizer injects forces has_local_code False, so a remote-code
+    repo lands on that branch: without an explicit default a plain load blocks
+    ~15s on a question nobody asked, in a notebook or a Studio worker."""
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "RemoteTokenizer",
+        "auto_map": {"AutoTokenizer": ["tokenization_custom.RemoteTokenizer", None]},
+    }))
+    (tmp_path / "tokenization_custom.py").write_text("class RemoteTokenizer: pass\n")
+
+    # Record rather than raise: resolve_trust_remote_code wraps the prompt in
+    # `except Exception` and rewrites anything raised here into the same
+    # ValueError the passing path produces, which hides the prompt entirely.
+    prompts = []
+
+    def fake_input(*args, **kwargs):
+        prompts.append(args)
+        return "n"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    with pytest.raises(ValueError, match="custom code"):
+        loader._load_mlx_tokenizer(tmp_path)
+    assert not prompts, "tokenizer load prompted on stdin for remote code"

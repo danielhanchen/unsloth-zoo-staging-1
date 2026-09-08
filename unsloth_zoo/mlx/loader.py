@@ -842,6 +842,12 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     )
 
     auto_loader = _auto_loader or AutoTokenizer.from_pretrained
+    # Not a default for its own sake: transformers treats a missing
+    # trust_remote_code as None, and resolve_trust_remote_code answers None by
+    # prompting on stdin for TIME_OUT_REMOTE_CODE seconds. The blank config
+    # below forces has_local_code False, so a remote-code repo reaches exactly
+    # that branch and a plain load blocks ~15s on a question nobody asked.
+    kwargs.setdefault("trust_remote_code", False)
     metadata = get_tokenizer_config(model_path, **kwargs)
     class_name = metadata.get("tokenizer_class")
     remote = _remote_code_reference(metadata, "AutoTokenizer")
