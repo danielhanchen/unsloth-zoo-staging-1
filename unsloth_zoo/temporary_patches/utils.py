@@ -1185,6 +1185,43 @@ _DISABLED_HOOK_SIGNATURES = (
 )
 
 
+_NO_COMPILED_FRAMES_SIGNATURE = ("fullgraph=True", "found no compiled frames")
+
+
+def dynamo_tracing_disabled():
+    """Has the user switched Dynamo off process-wide?
+
+    `TORCHDYNAMO_DISABLE=1` is the documented way to take torch.compile out of
+    the picture while debugging, and torch reads it into `config.disable` when
+    `torch._dynamo` is imported. `torch._dynamo.config.disable = True` is the
+    same switch set by hand.
+    """
+    try:
+        import torch._dynamo
+        return bool(torch._dynamo.config.disable)
+    except Exception:
+        return False
+
+
+def _is_fullgraph_without_frames(exc):
+    """Did a `fullgraph = True` region refuse because tracing is disabled?
+
+    From torch 2.14 a compiled region whose frames were all skipped raises
+
+        RuntimeError: torch.compile with fullgraph=True found no compiled
+        frames. Skipped frames: ... Dynamo tracing is disabled
+
+    where earlier torch quietly ran the function eagerly. Disabling Dynamo is a
+    request for eager, so this is not a defect to surface; matched on the
+    signature so any other RuntimeError still raises.
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        return False
+    return all(part in text for part in _NO_COMPILED_FRAMES_SIGNATURE)
+
+
 def _is_our_own_disabled_hook(exc):
     """Did we break our own graph with our own `torch.compiler.disable`?
 
@@ -1748,6 +1785,19 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             f"apart from speed.",
         )
 
+    def _give_up_on_disabled_dynamo(e, args, kwargs, marker_before):
+        """Dynamo was switched off after this wrapper was built.
+
+        Same bare eager flip as the disabled-hook arm: nothing ever compiled,
+        so there is no pack that a later recompute could disagree with.
+        """
+        return _give_up_at_compile_time(
+            e, args, kwargs, marker_before,
+            f"Unsloth: Dynamo tracing is disabled, so {label} cannot be "
+            f"compiled; running it eagerly from here. Training is unaffected "
+            f"apart from speed.",
+        )
+
     def _is_backend_refusal_we_handle(e):
         """The gate the wrapper's own backend arm applies, in one place."""
         if _wants_hard_backend_failure():
@@ -1916,6 +1966,15 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             if not _is_our_own_disabled_hook(e):
                 raise
             return _give_up_on_disabled_hook(e, args, kwargs, marker_before)
+        except RuntimeError as e:
+            # Last arm on purpose: every typed class above gets first refusal,
+            # and several of them are RuntimeError subclasses. Only torch
+            # 2.14's "found no compiled frames" lands here, which happens when
+            # Dynamo was switched off after this wrapper was built. The
+            # decoration-time guard cannot see that, so catch it once and latch.
+            if not _is_fullgraph_without_frames(e):
+                raise
+            return _give_up_on_disabled_dynamo(e, args, kwargs, marker_before)
         else:
             # The compiled callable returned, so anything it packed under a
             # checkpoint is packed compiled. Only `_give_up_on_backend` reads
@@ -2051,6 +2110,12 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     """
     def _decorate(func):
         func = unwrap_already_compiled(func)
+        if fullgraph and dynamo_tracing_disabled():
+            # Nothing can be traced, so from torch 2.14 the compiled callable
+            # raises instead of running eagerly. Hand back the plain function:
+            # that is what disabling Dynamo asked for, and it keeps the region
+            # working on every torch version.
+            return func
         compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
         if not fullgraph:
             return compiled
