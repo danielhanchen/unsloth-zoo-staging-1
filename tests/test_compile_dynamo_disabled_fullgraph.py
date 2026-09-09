@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`fullgraph = True` regions when the user has switched Dynamo off.
+"""`fullgraph = True` regions when the user has switched the compiler off.
 
 `TORCH_COMPILE_DISABLE=1` (and `torch._dynamo.config.disable = True`, which is
 the same flag by hand) takes torch.compile out of the picture while debugging.
@@ -30,10 +30,13 @@ writes the decorator into every generated `unsloth_compiled_cache` module. So a
 user who disables torch.compile on torch 2.14 loses GRPO training at the first
 step, having asked only to turn the compiler off.
 
-The flag is therefore read live, before each call, rather than recovered from
-after one: torch has already run the body by the time it raises, so recovering
-would run it twice, and entering the compiled callable at all makes torch mark
-the code object skipped permanently.
+The flag is read before the call, never recovered from after one: torch has
+already run the body by the time it raises, so recovering would run it twice.
+And it is read at the FIRST call, not at decoration and not on every call. At
+decoration is too early, since a flag set only while modules import would stick
+for the run. Every call is too late to be consistent: a checkpoint's pack and
+its recompute must agree, and by the time a recompute runs the forward that
+packed it is gone.
 
 `TORCHDYNAMO_DISABLE=1` is a different switch, handled inside
 `torch._dynamo.optimize`, which returns the undecorated function. Nothing here
@@ -48,8 +51,10 @@ from unsloth_zoo.temporary_patches import utils as u
 
 @pytest.fixture(autouse = True)
 def clear_checkpoint_markers():
-    # Process-wide and only a step boundary clears them, so a test that packs
-    # under a checkpoint would otherwise decide the next test's mode.
+    # A compiled call under a checkpoint sets these process-wide, and only a
+    # step boundary clears them. Left set, they make the recompile-limit arm
+    # re-raise rather than fall back, in this file's tests and in any that run
+    # after it.
     yield
     u._PACKED_COMPILED_IN_CHECKPOINT = False
     u._COMPILED_OK_LABELS.clear()
@@ -77,6 +82,29 @@ def _counting_fn():
     return src["f"], calls
 
 
+def _checkpointed_wrapper():
+    """One wrapper plus the list of its body executions."""
+    calls = []
+    src = {}
+    exec("def block(x, w):\n"
+         "    calls.append(1)\n"
+         "    return torch.nn.functional.layer_norm(x @ w, (w.shape[-1],)).sin()\n",
+         {"calls": calls, "torch": torch}, src)
+    return u.torch_compile_with_fallback(fullgraph = True)(src["block"]), calls
+
+
+def _pack(wrapped):
+    """One non-reentrant checkpointed forward. Returns (output, weight)."""
+    from torch.utils.checkpoint import checkpoint
+    torch.manual_seed(0)
+    x = torch.randn(4, 8, requires_grad = True)
+    w = torch.randn(8, 8, requires_grad = True)
+    return checkpoint(wrapped, x, w, use_reentrant = False), w
+
+
+# --------------------------------------------------------------- the dispatch
+
+
 def test_decorated_before_disabling_runs_eagerly_and_exactly_once():
     fn, calls = _counting_fn()
     wrapped = u.torch_compile_with_fallback(fullgraph = True)(fn)
@@ -101,20 +129,22 @@ def test_decorated_while_disabled_runs_eagerly_and_exactly_once(dynamo_off):
     assert len(calls) == 1
 
 
-def test_re_enabling_dynamo_restores_compilation():
-    # Discarding the compiled callable at decoration time made a flag that was
-    # set only during import permanent for the rest of the run.
+def test_a_flag_held_only_over_decoration_does_not_stick():
+    """Disabled while the module imports, restored before the first call.
+
+    Deciding at decoration time pinned such a region to eager for the whole
+    run, which is what reading the flag at the first call instead avoids.
+    """
     fn, _ = _counting_fn()
-    wrapped = u.torch_compile_with_fallback(fullgraph = True)(fn)
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = True
     try:
-        wrapped(torch.zeros(3))
+        wrapped = u.torch_compile_with_fallback(fullgraph = True)(fn)
     finally:
         torch._dynamo.config.disable = prev
     assert torch.equal(wrapped(torch.zeros(3)), torch.ones(3))
-    state = getattr(wrapped, "_unsloth_fallback_state", {})
-    assert not state.get("eager", False)
+    assert wrapped._unsloth_fallback_state["compiler_off"] is False
+    assert wrapped._unsloth_fallback_state["eager"] is False
 
 
 def test_fullgraph_false_is_untouched(dynamo_off):
@@ -123,92 +153,14 @@ def test_fullgraph_false_is_untouched(dynamo_off):
 
 
 def test_a_real_graph_break_still_raises():
-    # The eager dispatch is keyed on the live flag, not on an error message, so
-    # a genuine fullgraph failure is never absorbed.
+    # The eager dispatch is keyed on the flag, not on an error message, so a
+    # genuine fullgraph failure is never absorbed.
     def breaks(x):
         print("graph break")
         return x + 1
     wrapped = u.torch_compile_with_fallback(fullgraph = True)(breaks)
     with pytest.raises(Exception):
         wrapped(torch.zeros(3))
-
-
-def _checkpointed_step(flip_to):
-    from torch.utils.checkpoint import checkpoint
-
-    def block(x, w):
-        return torch.nn.functional.layer_norm(x @ w, (w.shape[-1],)) * x
-
-    torch.manual_seed(0)
-    wrapped = u.torch_compile_with_fallback(fullgraph = True)(block)
-    x = torch.randn(4, 8, requires_grad = True)
-    w = torch.randn(8, 8, requires_grad = True)
-    out = checkpoint(wrapped, x, w, use_reentrant = False)
-    if flip_to is not None:
-        torch._dynamo.config.disable = flip_to
-    out.sum().backward()
-    return w.grad
-
-
-def _checkpointed_wrapper():
-    """One wrapper plus the list of body executions, for multi-step tests."""
-    calls = []
-    src = {}
-    exec("def block(x, w):\n"
-         "    calls.append(1)\n"
-         "    return torch.nn.functional.layer_norm(x @ w, (w.shape[-1],)).sin()\n",
-         {"calls": calls, "torch": torch}, src)
-    return u.torch_compile_with_fallback(fullgraph = True)(src["block"]), calls
-
-
-def _run_checkpointed(wrapped):
-    from torch.utils.checkpoint import checkpoint
-    torch.manual_seed(0)
-    x = torch.randn(4, 8, requires_grad = True)
-    w = torch.randn(8, 8, requires_grad = True)
-    checkpoint(wrapped, x, w, use_reentrant = False).sum().backward()
-    return w.grad
-
-
-@pytest.mark.parametrize("starts_disabled", [True, False])
-def test_a_mid_step_flip_does_not_abort_a_checkpointed_backward(starts_disabled):
-    """A flip between a checkpointed forward and its backward keeps its mode.
-
-    Non-reentrant checkpointing recomputes the forward during backward and
-    compares what each pass saved, so recomputing a compiled pack eagerly, or
-    an eager pack compiled, raises `CheckpointError` and ends the step.
-    """
-    prev = torch._dynamo.config.disable
-    try:
-        torch._dynamo.config.disable = starts_disabled
-        want = _checkpointed_step(flip_to = None)
-        u._PACKED_COMPILED_IN_CHECKPOINT = False
-        u._COMPILED_OK_LABELS.clear()
-        torch._dynamo.config.disable = starts_disabled
-        got = _checkpointed_step(flip_to = not starts_disabled)
-    finally:
-        torch._dynamo.config.disable = prev
-    assert torch.allclose(want, got, atol = 1e-5)
-
-
-def test_a_nested_wrapper_is_traceable_after_running_eager():
-    # The checkpoint probe reaches a pybind builtin Dynamo refuses to enter, so
-    # an outer fullgraph trace of a wrapper that has run eager must not take it.
-    def inner(x):
-        return x * 2
-    wrapped = u.torch_compile_with_fallback(fullgraph = True)(inner)
-    prev = torch._dynamo.config.disable
-    torch._dynamo.config.disable = True
-    try:
-        wrapped(torch.zeros(3))
-    finally:
-        torch._dynamo.config.disable = prev
-
-    def outer(x):
-        return wrapped(x) + 1
-    assert torch.equal(
-        torch.compile(outer, fullgraph = True)(torch.zeros(3)), torch.ones(3),
-    )
 
 
 def test_the_force_eager_stance_is_left_to_torch():
@@ -226,65 +178,8 @@ def test_the_force_eager_stance_is_left_to_torch():
     assert len(calls) == 1
 
 
-def test_another_regions_pack_does_not_force_this_one_into_the_compiler():
-    # The evidence is per wrapper, not a process-wide marker or a shared
-    # __qualname__: a wrapper with nothing cached must still go eager.
-    fn, calls = _counting_fn()
-    other, _ = _counting_fn()
-    other.__qualname__ = fn.__qualname__              # a colliding label
-    compiled_one = u.torch_compile_with_fallback(fullgraph = True)(other)
-    u._PACKED_COMPILED_IN_CHECKPOINT = True           # some other region's pack
-    compiled_one(torch.zeros(3))                      # records the shared label
-    wrapped = u.torch_compile_with_fallback(fullgraph = True)(fn)
-    prev = torch._dynamo.config.disable
-    torch._dynamo.config.disable = True
-    try:
-        del calls[:]
-        got = wrapped(torch.zeros(3))
-    finally:
-        torch._dynamo.config.disable = prev
-    assert torch.equal(got, torch.ones(3))
-    assert len(calls) == 1
-
-
-def test_a_checkpointed_wrapper_compiles_again_on_the_next_step():
-    """Re-enabling must reach a wrapper that is only ever called under one.
-
-    Every checkpoint forward is inside a region, so deferring on "inside a
-    region" rather than "being recomputed" left such a wrapper eager forever.
-    """
-    prev = torch._dynamo.config.disable
-    try:
-        torch._dynamo.config.disable = True
-        wrapped, calls = _checkpointed_wrapper()
-        _run_checkpointed(wrapped)
-        torch._dynamo.config.disable = False
-        _run_checkpointed(wrapped)
-        _run_checkpointed(wrapped)
-    finally:
-        torch._dynamo.config.disable = prev
-    assert wrapped._unsloth_fallback_state["ran_eager_disabled"] is False
-    assert wrapped._unsloth_fallback_state["last_call_compiled"] is True
-
-
-def test_disabling_after_a_completed_checkpointed_step_takes_effect():
-    # The compiled evidence must not outlive the recompute it was for: nothing
-    # inside this package clears a step marker.
-    prev = torch._dynamo.config.disable
-    try:
-        torch._dynamo.config.disable = False
-        wrapped, calls = _checkpointed_wrapper()
-        _run_checkpointed(wrapped)
-        torch._dynamo.config.disable = True
-        del calls[:]
-        _run_checkpointed(wrapped)
-    finally:
-        torch._dynamo.config.disable = prev
-    # Forward plus recompute, each exactly once: eager, and never twice.
-    assert len(calls) == 2
-
-
 def test_dynamo_tracing_disabled_reads_the_live_config():
+    # The reader stays live; it is the wrapper that takes one snapshot.
     prev = torch._dynamo.config.disable
     try:
         torch._dynamo.config.disable = True
@@ -293,3 +188,111 @@ def test_dynamo_tracing_disabled_reads_the_live_config():
         assert u.dynamo_tracing_disabled() is False
     finally:
         torch._dynamo.config.disable = prev
+
+
+# ------------------------------------------------- checkpointing consistency
+#
+# Non-reentrant checkpointing recomputes the forward during backward and
+# compares what each pass saved, so a pack and its recompute running in
+# different modes raises CheckpointError and ends the step. Each of these was
+# a live failure of a per-call read of the flag.
+
+
+@pytest.mark.parametrize("disabled", [True, False])
+def test_a_checkpointed_step_runs_with_the_compiler_either_way(disabled):
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = disabled
+    try:
+        wrapped, calls = _checkpointed_wrapper()
+        del calls[:]
+        out, w = _pack(wrapped)
+        out.sum().backward()
+    finally:
+        torch._dynamo.config.disable = prev
+    assert w.grad is not None
+    if disabled:
+        # The forward and its recompute, each exactly once. Compiled, the
+        # recompute replays a graph and never re-enters the Python body.
+        assert len(calls) == 2
+
+
+def test_the_snapshot_survives_a_flip_between_a_forward_and_its_backward():
+    """Re-enabling mid-step must not recompute an eager pack compiled.
+
+    Only this direction is ours. Disabling mid-step over a COMPILED pack is
+    torch's own: it consults `config.disable` whenever it converts a frame, so
+    the recompute's variant is skipped and runs eager whatever we do. That case
+    raises `CheckpointError` identically on `main`.
+    """
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
+    try:
+        wrapped, _ = _checkpointed_wrapper()
+        out, w = _pack(wrapped)
+        torch._dynamo.config.disable = False
+        out.sum().backward()
+    finally:
+        torch._dynamo.config.disable = prev
+    assert w.grad is not None
+
+
+def test_two_outstanding_packs_of_one_wrapper_agree():
+    """Two live packs of one wrapper, with a flip between their forwards.
+
+    A mode held per wrapper and updated per call described only the newest
+    pack, so the older one was recomputed in the other mode. Fails on `main`
+    as well, where the second forward is what changes mode.
+    """
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
+    try:
+        wrapped, _ = _checkpointed_wrapper()
+        first, w1 = _pack(wrapped)
+        torch._dynamo.config.disable = False
+        second, w2 = _pack(wrapped)
+        (first.sum() + second.sum()).backward()
+    finally:
+        torch._dynamo.config.disable = prev
+    assert w1.grad is not None and w2.grad is not None
+
+
+def test_a_completed_checkpointed_step_leaves_no_state_to_expire():
+    """The decision is the wrapper's own, and it does not drift after a step.
+
+    Nothing in this package calls `apply_pending_eager_fallbacks`, so a mode
+    that had to be expired at a step boundary never would be. Checked away from
+    a checkpoint: whether torch can still run a COMPILED region once the flag
+    is set is torch's own frame-conversion behaviour, unchanged from `main`.
+    """
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = False
+    try:
+        wrapped, _ = _checkpointed_wrapper()
+        out, w = _pack(wrapped)
+        out.sum().backward()
+        assert w.grad is not None
+        torch._dynamo.config.disable = True
+        assert wrapped._unsloth_fallback_state["compiler_off"] is False
+        assert wrapped._unsloth_fallback_state["eager"] is False
+    finally:
+        torch._dynamo.config.disable = prev
+
+
+def test_a_nested_wrapper_is_traceable_after_running_eager():
+    # An outer fullgraph trace must not reach a checkpoint-hook probe: it is a
+    # pybind builtin Dynamo refuses to enter, which is fatal under fullgraph.
+    def inner(x):
+        return x * 2
+    wrapped = u.torch_compile_with_fallback(fullgraph = True)(inner)
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
+    try:
+        wrapped(torch.zeros(3))
+    finally:
+        torch._dynamo.config.disable = prev
+
+    def outer(x):
+        return wrapped(x) + 1
+    assert torch.equal(
+        torch.compile(outer, fullgraph = True)(torch.zeros(3)), torch.ones(3),
+    )
