@@ -150,6 +150,26 @@ def _checkpointed_step(flip_to):
     return w.grad
 
 
+def _checkpointed_wrapper():
+    """One wrapper plus the list of body executions, for multi-step tests."""
+    calls = []
+    src = {}
+    exec("def block(x, w):\n"
+         "    calls.append(1)\n"
+         "    return torch.nn.functional.layer_norm(x @ w, (w.shape[-1],)).sin()\n",
+         {"calls": calls, "torch": torch}, src)
+    return u.torch_compile_with_fallback(fullgraph = True)(src["block"]), calls
+
+
+def _run_checkpointed(wrapped):
+    from torch.utils.checkpoint import checkpoint
+    torch.manual_seed(0)
+    x = torch.randn(4, 8, requires_grad = True)
+    w = torch.randn(8, 8, requires_grad = True)
+    checkpoint(wrapped, x, w, use_reentrant = False).sum().backward()
+    return w.grad
+
+
 @pytest.mark.parametrize("starts_disabled", [True, False])
 def test_a_mid_step_flip_does_not_abort_a_checkpointed_backward(starts_disabled):
     """A flip between a checkpointed forward and its backward keeps its mode.
@@ -207,13 +227,17 @@ def test_the_force_eager_stance_is_left_to_torch():
 
 
 def test_another_regions_pack_does_not_force_this_one_into_the_compiler():
-    # The marker is process-wide, so it says only that SOMETHING compiled. A
-    # wrapper with nothing cached must still go eager, or torch 2.14 raises.
+    # The evidence is per wrapper, not a process-wide marker or a shared
+    # __qualname__: a wrapper with nothing cached must still go eager.
     fn, calls = _counting_fn()
+    other, _ = _counting_fn()
+    other.__qualname__ = fn.__qualname__              # a colliding label
+    compiled_one = u.torch_compile_with_fallback(fullgraph = True)(other)
+    u._PACKED_COMPILED_IN_CHECKPOINT = True           # some other region's pack
+    compiled_one(torch.zeros(3))                      # records the shared label
     wrapped = u.torch_compile_with_fallback(fullgraph = True)(fn)
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = True
-    u._PACKED_COMPILED_IN_CHECKPOINT = True          # some other region's pack
     try:
         del calls[:]
         got = wrapped(torch.zeros(3))
@@ -221,6 +245,43 @@ def test_another_regions_pack_does_not_force_this_one_into_the_compiler():
         torch._dynamo.config.disable = prev
     assert torch.equal(got, torch.ones(3))
     assert len(calls) == 1
+
+
+def test_a_checkpointed_wrapper_compiles_again_on_the_next_step():
+    """Re-enabling must reach a wrapper that is only ever called under one.
+
+    Every checkpoint forward is inside a region, so deferring on "inside a
+    region" rather than "being recomputed" left such a wrapper eager forever.
+    """
+    prev = torch._dynamo.config.disable
+    try:
+        torch._dynamo.config.disable = True
+        wrapped, calls = _checkpointed_wrapper()
+        _run_checkpointed(wrapped)
+        torch._dynamo.config.disable = False
+        _run_checkpointed(wrapped)
+        _run_checkpointed(wrapped)
+    finally:
+        torch._dynamo.config.disable = prev
+    assert wrapped._unsloth_fallback_state["ran_eager_disabled"] is False
+    assert wrapped._unsloth_fallback_state["last_call_compiled"] is True
+
+
+def test_disabling_after_a_completed_checkpointed_step_takes_effect():
+    # The compiled evidence must not outlive the recompute it was for: nothing
+    # inside this package clears a step marker.
+    prev = torch._dynamo.config.disable
+    try:
+        torch._dynamo.config.disable = False
+        wrapped, calls = _checkpointed_wrapper()
+        _run_checkpointed(wrapped)
+        torch._dynamo.config.disable = True
+        del calls[:]
+        _run_checkpointed(wrapped)
+    finally:
+        torch._dynamo.config.disable = prev
+    # Forward plus recompute, each exactly once: eager, and never twice.
+    assert len(calls) == 2
 
 
 def test_dynamo_tracing_disabled_reads_the_live_config():
