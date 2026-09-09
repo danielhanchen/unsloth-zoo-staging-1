@@ -163,6 +163,10 @@ def test_a_real_graph_break_still_raises():
         wrapped(torch.zeros(3))
 
 
+@pytest.mark.skipif(
+    not hasattr(getattr(torch, "compiler", None), "set_stance"),
+    reason = "torch.compiler.set_stance is new in torch 2.6; the floor is 2.4",
+)
 def test_the_force_eager_stance_is_left_to_torch():
     # torch only raises "found no compiled frames" while the stance is
     # "default" (torch/_dynamo/eval_frame.py), so force_eager needs nothing.
