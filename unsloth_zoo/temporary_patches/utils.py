@@ -902,11 +902,6 @@ def _in_non_reentrant_checkpoint():
 # eagerly in backward -- an abort, or wrong gradients when the shapes line up.
 _PACKED_COMPILED_IN_CHECKPOINT = False
 
-# The mirror of the above for the disabled-compiler dispatch: activations packed
-# EAGER because the flag was set, so re-enabling the compiler mid-step must not
-# recompute them compiled. Cleared at the same step boundaries.
-_PACKED_EAGER_IN_CHECKPOINT = False
-
 
 def _dynamo_is_tracing():
     """True while Dynamo is compiling the caller, across the supported torches."""
@@ -1521,7 +1516,10 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # every step boundary. See that set for why the answer has to be per step
     # rather than per wrapper.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
-             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0}
+             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0,
+             # Set the first time the disabled-compiler branch runs, cleared the
+             # first time it is safe to compile again. See the wrapper.
+             "ran_eager_disabled": False}
 
     def _warn(message):
         if not state["warned"]:
@@ -1894,9 +1892,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
-        global _PACKED_EAGER_IN_CHECKPOINT
-        if (dynamo_tracing_disabled() or _PACKED_EAGER_IN_CHECKPOINT) and \
-            not _PACKED_COMPILED_IN_CHECKPOINT:
+        if dynamo_tracing_disabled() and not (
+            _PACKED_COMPILED_IN_CHECKPOINT and label in _COMPILED_OK_LABELS
+        ):
             # Checked BEFORE the call, not recovered from afterwards. Torch runs
             # the body and only then raises "found no compiled frames" from its
             # post-call bookkeeping (torch/_dynamo/eval_frame.py), so catching
@@ -1908,22 +1906,35 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # is also what keeps the region compilable once the user switches
             # the compiler back on.
             #
-            # The marker defers a flip made mid-step, exactly as the
-            # recompile-limit arm below does. Something already packed compiled
+            # The two markers defer a flip made mid-step, exactly as the
+            # recompile-limit arm below does. THIS wrapper packed compiled
             # activations under a non-reentrant checkpoint this step, so going
             # eager now would recompute that pack in the other mode and abort
             # the backward with `CheckpointError`. Staying compiled is safe
             # precisely because it packed: torch reads `config.disable` when it
             # converts a frame, not when it runs code it has already compiled.
-            # `apply_pending_eager_fallbacks` clears the marker at the step
-            # boundary and the flip takes effect from the next step.
+            # Both are per step and `apply_pending_eager_fallbacks` clears them,
+            # so the flip takes effect from the next step.
             #
-            # `_PACKED_EAGER_IN_CHECKPOINT` is the same deferral mirrored: a
-            # flip the other way, mid-step, would recompute an eager pack
-            # compiled and abort the same backward.
-            if _in_non_reentrant_checkpoint():
-                _PACKED_EAGER_IN_CHECKPOINT = True
+            # `_PACKED_COMPILED_IN_CHECKPOINT` alone is not enough: it is
+            # process-wide, so another region's pack would send a wrapper with
+            # nothing cached into `compiled_func` and back to the error above.
+            state["ran_eager_disabled"] = True
             return eager_func(*args, **kwargs)
+        if state["ran_eager_disabled"]:
+            # Re-enabled after this wrapper ran eager. Asked at the point it
+            # matters rather than latched: a region that packed eager is
+            # recomputed INSIDE that region during backward, so being in one
+            # here is the signal that a pack is still owed, and compiling now
+            # would abort it with `CheckpointError`. Outside one there is
+            # nothing to disagree with, so honour the flag and stop asking.
+            # `_dynamo_is_tracing` first: the probe reaches a pybind builtin
+            # Dynamo refuses to enter, fatal under `fullgraph = True`, the same
+            # guard `_note_packed_under_checkpoint` carries.
+            if not _dynamo_is_tracing() and \
+                _in_non_reentrant_checkpoint() is True:
+                return eager_func(*args, **kwargs)
+            state["ran_eager_disabled"] = False
         marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:
             _note_packed_under_checkpoint()
@@ -2144,12 +2155,7 @@ def apply_pending_eager_fallbacks() -> int:
     # and made `_give_up` re-raise for a later call nowhere near a checkpoint.
     # Cleared first, before any early return below.
     global _PACKED_COMPILED_IN_CHECKPOINT, _CHECKPOINT_PROBE_MISSES
-    global _PACKED_EAGER_IN_CHECKPOINT
     _PACKED_COMPILED_IN_CHECKPOINT = False
-    # Only here, not in `_restore_recompile_limits`: that runs mid-step whenever
-    # the last bump goes back, and clearing this one there would let a
-    # half-packed region recompute compiled.
-    _PACKED_EAGER_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0             # a new step, a new probe budget
     _COMPILED_OK_LABELS.clear()              # and a new compiled-pack history
     _settled = _settle_abandoned_checkpoint_generator()

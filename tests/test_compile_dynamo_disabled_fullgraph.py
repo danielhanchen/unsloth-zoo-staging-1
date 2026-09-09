@@ -48,11 +48,11 @@ from unsloth_zoo.temporary_patches import utils as u
 
 @pytest.fixture(autouse = True)
 def clear_checkpoint_markers():
-    # Both are process-wide and only a step boundary clears them, so a test that
-    # packs under a checkpoint would otherwise decide the next test's mode.
+    # Process-wide and only a step boundary clears them, so a test that packs
+    # under a checkpoint would otherwise decide the next test's mode.
     yield
-    u._PACKED_EAGER_IN_CHECKPOINT = False
     u._PACKED_COMPILED_IN_CHECKPOINT = False
+    u._COMPILED_OK_LABELS.clear()
 
 
 @pytest.fixture
@@ -133,43 +133,94 @@ def test_a_real_graph_break_still_raises():
         wrapped(torch.zeros(3))
 
 
-@pytest.mark.parametrize("starts_disabled", [True, False])
-def test_a_mid_step_flip_does_not_abort_a_checkpointed_backward(starts_disabled):
-    """A flip between a checkpointed forward and its backward keeps its mode.
-
-    Non-reentrant checkpointing recomputes the forward during backward and
-    compares what each pass saved, so recomputing a compiled pack eagerly (or
-    the reverse) raises `CheckpointError` and ends the step. The flag is read
-    live, so the mode is held for the rest of the step once activations are
-    packed, and the flip takes effect at the next step boundary.
-    """
+def _checkpointed_step(flip_to):
     from torch.utils.checkpoint import checkpoint
 
     def block(x, w):
         return torch.nn.functional.layer_norm(x @ w, (w.shape[-1],)) * x
 
-    def one_step(flip):
-        torch.manual_seed(0)
-        wrapped = u.torch_compile_with_fallback(fullgraph = True)(block)
-        x = torch.randn(4, 8, requires_grad = True)
-        w = torch.randn(8, 8, requires_grad = True)
-        out = checkpoint(wrapped, x, w, use_reentrant = False)
-        if flip:
-            torch._dynamo.config.disable = not torch._dynamo.config.disable
-        out.sum().backward()
-        return w.grad
+    torch.manual_seed(0)
+    wrapped = u.torch_compile_with_fallback(fullgraph = True)(block)
+    x = torch.randn(4, 8, requires_grad = True)
+    w = torch.randn(8, 8, requires_grad = True)
+    out = checkpoint(wrapped, x, w, use_reentrant = False)
+    if flip_to is not None:
+        torch._dynamo.config.disable = flip_to
+    out.sum().backward()
+    return w.grad
 
+
+@pytest.mark.parametrize("starts_disabled", [True, False])
+def test_a_mid_step_flip_does_not_abort_a_checkpointed_backward(starts_disabled):
+    """A flip between a checkpointed forward and its backward keeps its mode.
+
+    Non-reentrant checkpointing recomputes the forward during backward and
+    compares what each pass saved, so recomputing a compiled pack eagerly, or
+    an eager pack compiled, raises `CheckpointError` and ends the step.
+    """
     prev = torch._dynamo.config.disable
     try:
         torch._dynamo.config.disable = starts_disabled
-        want = one_step(flip = False)
-        torch._dynamo.config.disable = starts_disabled
-        u._PACKED_EAGER_IN_CHECKPOINT = False
+        want = _checkpointed_step(flip_to = None)
         u._PACKED_COMPILED_IN_CHECKPOINT = False
-        got = one_step(flip = True)
+        u._COMPILED_OK_LABELS.clear()
+        torch._dynamo.config.disable = starts_disabled
+        got = _checkpointed_step(flip_to = not starts_disabled)
     finally:
         torch._dynamo.config.disable = prev
     assert torch.allclose(want, got, atol = 1e-5)
+
+
+def test_a_nested_wrapper_is_traceable_after_running_eager():
+    # The checkpoint probe reaches a pybind builtin Dynamo refuses to enter, so
+    # an outer fullgraph trace of a wrapper that has run eager must not take it.
+    def inner(x):
+        return x * 2
+    wrapped = u.torch_compile_with_fallback(fullgraph = True)(inner)
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
+    try:
+        wrapped(torch.zeros(3))
+    finally:
+        torch._dynamo.config.disable = prev
+
+    def outer(x):
+        return wrapped(x) + 1
+    assert torch.equal(
+        torch.compile(outer, fullgraph = True)(torch.zeros(3)), torch.ones(3),
+    )
+
+
+def test_the_force_eager_stance_is_left_to_torch():
+    # torch only raises "found no compiled frames" while the stance is
+    # "default" (torch/_dynamo/eval_frame.py), so force_eager needs nothing.
+    fn, calls = _counting_fn()
+    wrapped = u.torch_compile_with_fallback(fullgraph = True)(fn)
+    torch.compiler.set_stance("force_eager")
+    try:
+        del calls[:]
+        got = wrapped(torch.zeros(3))
+    finally:
+        torch.compiler.set_stance("default")
+    assert torch.equal(got, torch.ones(3))
+    assert len(calls) == 1
+
+
+def test_another_regions_pack_does_not_force_this_one_into_the_compiler():
+    # The marker is process-wide, so it says only that SOMETHING compiled. A
+    # wrapper with nothing cached must still go eager, or torch 2.14 raises.
+    fn, calls = _counting_fn()
+    wrapped = u.torch_compile_with_fallback(fullgraph = True)(fn)
+    prev = torch._dynamo.config.disable
+    torch._dynamo.config.disable = True
+    u._PACKED_COMPILED_IN_CHECKPOINT = True          # some other region's pack
+    try:
+        del calls[:]
+        got = wrapped(torch.zeros(3))
+    finally:
+        torch._dynamo.config.disable = prev
+    assert torch.equal(got, torch.ones(3))
+    assert len(calls) == 1
 
 
 def test_dynamo_tracing_disabled_reads_the_live_config():
