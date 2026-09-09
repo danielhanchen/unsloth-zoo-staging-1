@@ -902,6 +902,11 @@ def _in_non_reentrant_checkpoint():
 # eagerly in backward -- an abort, or wrong gradients when the shapes line up.
 _PACKED_COMPILED_IN_CHECKPOINT = False
 
+# The mirror of the above for the disabled-compiler dispatch: activations packed
+# EAGER because the flag was set, so re-enabling the compiler mid-step must not
+# recompute them compiled. Cleared at the same step boundaries.
+_PACKED_EAGER_IN_CHECKPOINT = False
+
 
 def _dynamo_is_tracing():
     """True while Dynamo is compiling the caller, across the supported torches."""
@@ -1889,7 +1894,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
-        if dynamo_tracing_disabled():
+        global _PACKED_EAGER_IN_CHECKPOINT
+        if (dynamo_tracing_disabled() or _PACKED_EAGER_IN_CHECKPOINT) and \
+            not _PACKED_COMPILED_IN_CHECKPOINT:
             # Checked BEFORE the call, not recovered from afterwards. Torch runs
             # the body and only then raises "found no compiled frames" from its
             # post-call bookkeeping (torch/_dynamo/eval_frame.py), so catching
@@ -1899,7 +1906,23 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             # Not latched either: entering the compiled callable while tracing
             # is off makes torch mark the code object skipped for good, so this
             # is also what keeps the region compilable once the user switches
-            # Dynamo back on.
+            # the compiler back on.
+            #
+            # The marker defers a flip made mid-step, exactly as the
+            # recompile-limit arm below does. Something already packed compiled
+            # activations under a non-reentrant checkpoint this step, so going
+            # eager now would recompute that pack in the other mode and abort
+            # the backward with `CheckpointError`. Staying compiled is safe
+            # precisely because it packed: torch reads `config.disable` when it
+            # converts a frame, not when it runs code it has already compiled.
+            # `apply_pending_eager_fallbacks` clears the marker at the step
+            # boundary and the flip takes effect from the next step.
+            #
+            # `_PACKED_EAGER_IN_CHECKPOINT` is the same deferral mirrored: a
+            # flip the other way, mid-step, would recompute an eager pack
+            # compiled and abort the same backward.
+            if _in_non_reentrant_checkpoint():
+                _PACKED_EAGER_IN_CHECKPOINT = True
             return eager_func(*args, **kwargs)
         marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:
@@ -2121,7 +2144,12 @@ def apply_pending_eager_fallbacks() -> int:
     # and made `_give_up` re-raise for a later call nowhere near a checkpoint.
     # Cleared first, before any early return below.
     global _PACKED_COMPILED_IN_CHECKPOINT, _CHECKPOINT_PROBE_MISSES
+    global _PACKED_EAGER_IN_CHECKPOINT
     _PACKED_COMPILED_IN_CHECKPOINT = False
+    # Only here, not in `_restore_recompile_limits`: that runs mid-step whenever
+    # the last bump goes back, and clearing this one there would let a
+    # half-packed region recompute compiled.
+    _PACKED_EAGER_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0             # a new step, a new probe budget
     _COMPILED_OK_LABELS.clear()              # and a new compiled-pack history
     _settled = _settle_abandoned_checkpoint_generator()

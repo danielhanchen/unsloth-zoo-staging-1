@@ -46,6 +46,15 @@ import torch
 from unsloth_zoo.temporary_patches import utils as u
 
 
+@pytest.fixture(autouse = True)
+def clear_checkpoint_markers():
+    # Both are process-wide and only a step boundary clears them, so a test that
+    # packs under a checkpoint would otherwise decide the next test's mode.
+    yield
+    u._PACKED_EAGER_IN_CHECKPOINT = False
+    u._PACKED_COMPILED_IN_CHECKPOINT = False
+
+
 @pytest.fixture
 def dynamo_off():
     prev = torch._dynamo.config.disable
@@ -122,6 +131,45 @@ def test_a_real_graph_break_still_raises():
     wrapped = u.torch_compile_with_fallback(fullgraph = True)(breaks)
     with pytest.raises(Exception):
         wrapped(torch.zeros(3))
+
+
+@pytest.mark.parametrize("starts_disabled", [True, False])
+def test_a_mid_step_flip_does_not_abort_a_checkpointed_backward(starts_disabled):
+    """A flip between a checkpointed forward and its backward keeps its mode.
+
+    Non-reentrant checkpointing recomputes the forward during backward and
+    compares what each pass saved, so recomputing a compiled pack eagerly (or
+    the reverse) raises `CheckpointError` and ends the step. The flag is read
+    live, so the mode is held for the rest of the step once activations are
+    packed, and the flip takes effect at the next step boundary.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    def block(x, w):
+        return torch.nn.functional.layer_norm(x @ w, (w.shape[-1],)) * x
+
+    def one_step(flip):
+        torch.manual_seed(0)
+        wrapped = u.torch_compile_with_fallback(fullgraph = True)(block)
+        x = torch.randn(4, 8, requires_grad = True)
+        w = torch.randn(8, 8, requires_grad = True)
+        out = checkpoint(wrapped, x, w, use_reentrant = False)
+        if flip:
+            torch._dynamo.config.disable = not torch._dynamo.config.disable
+        out.sum().backward()
+        return w.grad
+
+    prev = torch._dynamo.config.disable
+    try:
+        torch._dynamo.config.disable = starts_disabled
+        want = one_step(flip = False)
+        torch._dynamo.config.disable = starts_disabled
+        u._PACKED_EAGER_IN_CHECKPOINT = False
+        u._PACKED_COMPILED_IN_CHECKPOINT = False
+        got = one_step(flip = True)
+    finally:
+        torch._dynamo.config.disable = prev
+    assert torch.allclose(want, got, atol = 1e-5)
 
 
 def test_dynamo_tracing_disabled_reads_the_live_config():
