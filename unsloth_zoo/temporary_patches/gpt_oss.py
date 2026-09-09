@@ -1412,12 +1412,22 @@ elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
+
+# coordinate_descent_tuning used to be driven by use_combo_kernels too, so asking for combo
+# kernels also bought the tuning. Measured apart on T4/L4/A100/B200: combo kernels are free
+# (decode compile 7.36s vs 7.48s off), the tuning costs +28% on A100 and +32% on L4 decode
+# compile for no measurable gain anywhere. Default it off, opt in to re-measure.
+#
+# The 40GB test above is in GiB, so an A100-SXM4-40GB reports 39.49 and falls BELOW it.
+# Left as-is: combo kernels measured as no-effect on both sides of the boundary.
+use_coordinate_descent = os.environ.get("UNSLOTH_COORDINATE_DESCENT_TUNING", "0") == "1"
+
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    coordinate_descent_tuning = use_coordinate_descent, # Very slow, and no measured gain
     combo_kernels = use_combo_kernels,
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -1429,7 +1439,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    coordinate_descent_tuning = use_coordinate_descent, # Very slow, and no measured gain
     combo_kernels = False, # Breaks on attention
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
